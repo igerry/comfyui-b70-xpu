@@ -7,3 +7,6 @@ __pycache__/
 
 # local working notes, not published
 CLAUDE.md
+
+# internal lab notebook (separate local git repository), not published
+internal/
