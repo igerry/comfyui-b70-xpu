@@ -13,7 +13,7 @@ Nothing is downloaded for you. File names used by the benchmark scripts:
 | Qwen-Image 2.1 | `qwen_image_2.1_bf16` or `_int8_convrot` | `qwen3vl_8b_bf16` or `_int8_convrot` | `qwen_image_2.1_vae_bf16` | `Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r256` |
 | Music 3 | `minimax_music3_dit_fp16` or `_int8_convrot` | `minimax_music3_text_encoder_pruned_bf16` | `minimax_music3_dav` | |
 
-Which weights to use on a B70 is in the top-level README ("Model files").
+Which weights to use on a B70 is in the top-level README ("Supported models").
 
 ## Workflows
 

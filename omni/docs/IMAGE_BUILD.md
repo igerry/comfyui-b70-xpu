@@ -46,7 +46,7 @@ docker run --rm --device=/dev/dri <image> /llm/entrypoints/validate_comfyui_imag
 
 Checks package identity, the Torch ABI of the native wheel, the Kitchen XPU backend signature,
 XPU availability, and that ComfyUI treats XPU INT8 as native. `--no-gpu` skips the device checks.
-Then run `benchmarks/suite.sh` against the running server and compare with the README tables.
+Then run `benchmarks/suite.sh` against the running server and compare with [BENCHMARKS.md](BENCHMARKS.md).
 
 # Installing without Docker
 
@@ -159,7 +159,7 @@ Then follow "Check that it is working" in the README.
 
 Upstream moves quickly and the XPU layer hooks into private call sites. After any ComfyUI or
 comfy-kitchen upgrade, a startup log full of `applied` lines does **not** mean the fast paths are
-in use. On the 0.34 → 0.39 upgrade three things broke silently (README, "Compatibility fixes").
+in use. On the 0.34 → 0.39 upgrade three things broke silently ([OPTIMIZATIONS.md](OPTIMIZATIONS.md)).
 Check, in this order:
 
 1. The log line `Native ops: ...` must contain `int8_tensorwise` and `convrot_w4a4`. If they are

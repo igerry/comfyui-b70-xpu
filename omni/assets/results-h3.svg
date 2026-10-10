@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="348" viewBox="0 0 860 348" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" role="img" aria-label="MiniMax H3 video: Intel's image vs. this repo">
+<text x="0" y="24" font-size="18" font-weight="600" fill="#768390">MiniMax H3 video: Intel's image vs. this repo</text>
+<text x="0" y="46" font-size="13" fill="#768390">seconds per job, lower is better · one Arc Pro B70 · each pair is scaled to its own baseline</text>
+<rect x="0" y="60" width="12" height="12" rx="2" fill="#8b949e"/>
+<text x="18" y="71" font-size="13" fill="#768390">intel/llm-scaler-omni:0.2.0-b1</text>
+<rect x="246.0" y="60" width="12" height="12" rx="2" fill="#2f81f7"/>
+<text x="264.0" y="71" font-size="13" fill="#768390">comfyui-b70-xpu</text>
+<text x="0" y="106" font-size="14" font-weight="600" fill="#768390">480×864, new prompt</text>
+<text x="0" y="124" font-size="12" fill="#768390">a real job: text encoder + model swap</text>
+<rect x="250" y="92" width="420" height="17" rx="3" fill="#8b949e"/>
+<text x="678" y="105" font-size="13" fill="#768390">87.5–87.8 s</text>
+<rect x="250" y="113" width="340.9" height="17" rx="3" fill="#2f81f7"/>
+<text x="598.9" y="126" font-size="13" font-weight="600" fill="#2f81f7">69.9–72.4 s</text>
+<text x="860" y="117" font-size="16" font-weight="700" fill="#3fb950" text-anchor="end">−19%</text>
+<text x="0" y="168" font-size="14" font-weight="600" fill="#768390">480×864, new seed</text>
+<text x="0" y="186" font-size="12" fill="#768390">kernels only</text>
+<rect x="250" y="154" width="420" height="17" rx="3" fill="#8b949e"/>
+<text x="678" y="167" font-size="13" fill="#768390">59.2–59.4 s</text>
+<rect x="250" y="175" width="395.6" height="17" rx="3" fill="#2f81f7"/>
+<text x="653.6" y="188" font-size="13" font-weight="600" fill="#2f81f7">55.7–56.0 s</text>
+<text x="860" y="179" font-size="16" font-weight="700" fill="#3fb950" text-anchor="end">−6%</text>
+<text x="0" y="230" font-size="14" font-weight="600" fill="#768390">704×1280, new prompt</text>
+<text x="0" y="248" font-size="12" fill="#768390">a real job</text>
+<rect x="250" y="216" width="420" height="17" rx="3" fill="#8b949e"/>
+<text x="678" y="229" font-size="13" fill="#768390">210.9–213.3 s</text>
+<rect x="250" y="237" width="366.6" height="17" rx="3" fill="#2f81f7"/>
+<text x="624.6" y="250" font-size="13" font-weight="600" fill="#2f81f7">185.1–185.2 s</text>
+<text x="860" y="241" font-size="16" font-weight="700" fill="#3fb950" text-anchor="end">−13%</text>
+<text x="0" y="292" font-size="14" font-weight="600" fill="#768390">704×1280, new seed</text>
+<text x="0" y="310" font-size="12" fill="#768390">kernels only</text>
+<rect x="250" y="278" width="420" height="17" rx="3" fill="#8b949e"/>
+<text x="678" y="291" font-size="13" fill="#768390">181.5–181.7 s</text>
+<rect x="250" y="299" width="392.4" height="17" rx="3" fill="#2f81f7"/>
+<text x="650.4" y="312" font-size="13" font-weight="600" fill="#2f81f7">169.5–169.8 s</text>
+<text x="860" y="303" font-size="16" font-weight="700" fill="#3fb950" text-anchor="end">−7%</text>
+</svg>

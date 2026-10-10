@@ -6,7 +6,8 @@ It replaces the ComfyUI 0.31 / torch 2.11 stack of that image with upstream Comf
 torch 2.13, a rebuilt `omni_xpu_kernel`, the XPU-enabled Comfy Kitchen backend on stock
 comfy-kitchen 0.2.37, and an extended `ComfyUI-OmniXPU` integration layer.
 
-What changed and what it is worth, with all measurements: [../README.md](../README.md).
+What changed and what it is worth: [../README.md](../README.md), [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md),
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 > [!IMPORTANT]
 > `0.1.0-b1` is published as `gerrywang/comfyui-b70-xpu:0.1.0-b1` (10.8 GB) and as a source build. It is tested on one Arc Pro B70 with four models
@@ -124,9 +125,10 @@ No custom nodes other than `ComfyUI-OmniXPU` are installed in the new stack.
 
 ## Build and component documentation
 
+- [Benchmarks](docs/BENCHMARKS.md) and [optimizations](docs/OPTIMIZATIONS.md)
 - [Image build, acceptance, and bare-metal install](docs/IMAGE_BUILD.md)
 - [ComfyUI usage: models, switches, custom nodes](docs/COMFYUI.md)
 - [Omni XPU kernel](omni_xpu_kernel/README.md)
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md)
-- [Benchmarks](benchmarks/)
+- [Benchmark scripts](benchmarks/)
 - [Patch history with per-change reasoning](docs/history/README.md)
