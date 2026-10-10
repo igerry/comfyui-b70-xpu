@@ -58,8 +58,9 @@ try:
 except Exception as e:  # noqa: BLE001
     check("native extension loads (omni_xpu_kernel._C)", False, e)
 try:
-    from omni_xpu_kernel.cute import cute_fmha_torch  # noqa: F401
-    check("CUTE attention extension loads", True)
+    from omni_xpu_kernel import cute as _cute
+
+    check("CUTE attention extension loads", bool(_cute.is_available()))
 except Exception as e:  # noqa: BLE001
     check("CUTE attention extension loads", False, e)
 from omni_xpu_kernel import int8 as _i8

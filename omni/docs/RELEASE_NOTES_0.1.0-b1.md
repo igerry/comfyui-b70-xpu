@@ -4,7 +4,8 @@
 
 - **Source build**: `cd omni && bash build.sh` → `comfyui-b70-xpu:0.1.0-b1-comfyui-bmg`
 - **Base image**: [intel/llm-scaler-omni:0.2.0-b1](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b1/images/sha256-b692be544940c3896bdf11fb3d66bbc089f1214a9e4f6749c34de43db8fddf23)
-- **Tested on**: one Intel Arc Pro B70 (32 GB, 230 W)
+- **Image size**: 10.8 GB
+- **Tested on**: one Intel Arc Pro B70 (32 GB, 230 W); the benchmark suite was run both bare-metal and inside the image
 
 ### What’s new
 
@@ -43,4 +44,5 @@
 
 * Tested on one Arc Pro B70 only; kernels are compiled for `bmg`.
 * Not compared against Intel's unpublished `0.2.0-b2` source build (ComfyUI 0.39 / torch 2.14).
-* H3 with the INT8 video VAE is slower at 480×864 with a new prompt (77–79 s vs. 70–72 s); cause unknown.
+* H3 with the INT8 video VAE shows no gain at 480×864 once the prompt changes (74–79 s vs. 70–72 s); cause unknown.
+* All container runs used `--privileged`; inside LXC pass `--memory=<LXC memory size>`.

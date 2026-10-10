@@ -93,6 +93,8 @@ ARG XPU_TARGET=bmg
 ARG SOURCE_REVISION=unknown
 ARG SOURCE_DIRTY=unknown
 
+# The base image's working directory is /llm/entrypoints, which is replaced below.
+WORKDIR /llm
 RUN rm -rf /llm/ComfyUI /llm/entrypoints /llm/tools /llm/manifests /llm/patches \
  && git clone ${COMFYUI_REPOSITORY} /llm/ComfyUI \
  && cd /llm/ComfyUI && git checkout -q ${COMFYUI_COMMIT}

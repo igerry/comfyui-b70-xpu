@@ -66,7 +66,7 @@ Full tables, including the pre-upgrade stack and every caveat, are in [Benchmark
 ## Quick start (Docker)
 
 Requirements: a Linux host with an Arc B-series GPU and working drivers, Docker with BuildKit,
-about 45 GB of free disk (Intel's base image is 21 GB), internet access during the build.
+about 45 GB of free disk during the build (Intel's base image is 21 GB; the result is 10.8 GB), internet access during the build.
 
 ```bash
 git clone https://github.com/igerry/comfyui-b70-xpu.git
@@ -151,7 +151,7 @@ Which weights to pick on this card:
 
 | Model | Use | Why |
 |---|---|---|
-| H3 | INT8 main model (the only practical one in 32 GB). Video VAE: fp16 at 480p, INT8 at 704×1280 | see the H3 table below |
+| H3 | INT8 main model (the only practical one in 32 GB). Video VAE: fp16 at 480p, INT8 at 704×1280 | at 480p the INT8 VAE gains nothing once the prompt changes; see the H3 table below |
 | Krea-2 Turbo | **INT8** | 28% faster; composition nearly identical; model and text encoder fit in VRAM together, so a new prompt no longer swaps |
 | Qwen-Image 2.1, original 25 steps | **INT8** | 33% faster; same quality tier (PSNR 35 dB vs. float) |
 | Qwen-Image 2.1 + Viggle Turbo | **bf16** | on INT8 faces turn grey and soft |
@@ -309,9 +309,10 @@ Krea-2 is not, with or without our code. Where the upstream perturbation comes f
   matches the current column: for H3 the October work kept the speed through the ComfyUI upgrade,
   it did not add to it.
 - The INT8 video VAE is faster whenever only the seed changes, and at 704×1280 also with a new
-  prompt. At 480×864 with a new prompt it measured **slower** (77 – 79 s vs. 70 – 72 s). We have not
-  found out why; until then, fp16 is the better VAE for 480p production. Same-seed PSNR between the
-  two VAEs is 37.8 dB.
+  prompt. At 480×864 with a new prompt it shows no gain: 77 – 79 s on bare metal (two runs, slower
+  than fp16's 70 – 72 s) and 73.9 s in the container (one run). We have not found out why the
+  seed-only gain does not carry over; for 480p production, stay on the fp16 VAE. Same-seed PSNR
+  between the two VAEs is 37.8 dB.
 
 Other H3 workflows (seconds; *single runs* unless a range is given):
 
@@ -355,12 +356,33 @@ A new song costs about 26 s of autoregressive token generation, then DiT samplin
 
 ### The Docker image, verified
 
-The numbers above are from the bare-metal install. The image built from this repository was then
-run on the same machine with `omni/benchmarks/suite.sh`:
+The numbers above are from the bare-metal install. The image built from this repository
+(`comfyui-b70-xpu:0.1.0-b1-comfyui-bmg`, **10.8 GB**) was then run on the same machine with
+`omni/benchmarks/suite.sh`, started with `--privileged --device=/dev/dri --network=host
+--shm-size=16g --memory=96g`. `validate_comfyui_image.sh`: all checks passed. Errors in the
+container log over the whole run: 0.
 
-**Not done yet.** The image builds and `validate_comfyui_image.sh` runs, but the full benchmark
-inside the container has not been completed. Until this section has numbers, treat the tables
-above as bare-metal results that the image is expected, but not yet shown, to reproduce.
+| Seconds | Bare metal | In the container |
+|---|---|---|
+| H3 480×864, new seed | 55.7 – 56.0 | 55.1 – 55.7 |
+| H3 480×864, new prompt | 69.9 – 72.4 | 73.8 |
+| H3 480×864, INT8 video VAE, new seed / new prompt | 52.3 – 52.4 / 77.3 – 78.7 | 52.8 / 73.9 |
+| H3 704×1280, new seed / new prompt | 169.5 – 169.8 / 185.1 – 185.2 | 171.4 / 187.4 |
+| Krea-2 Turbo bf16, new seed / new prompt | 9.9 / 14 – 16 | 9.9 – 10.0 / 12.7 |
+| Krea-2 Turbo INT8, new seed | 6.9 – 7.3 | 6.9 |
+| Qwen-Image 2.1 bf16, 25 steps, 1280×720 | 15.4 – 15.8 | 15.8 |
+| Qwen-Image 2.1 + Viggle Turbo, 6 steps | 5.1 | 5.1 |
+| Qwen-Image 2.1 INT8, 1280×720 / 2048² | 10.3 – 10.6 / 67 – 68 | 10.3 / 67.5 – 69.8 |
+| Music 3 fp16 DiT, same lyrics | 79.0 | 78.0 |
+| Music 3 INT8 DiT, same lyrics / new song | 53.2 / 87 – 90 | 53.1 – 55.0 / 75.2 – 86.3 |
+
+Container values are one or two runs each. Within run-to-run noise the image reproduces the
+bare-metal install. With `--memory=96g` the pinned-memory budget inside the container is 80 GB;
+without it, on this LXC host, it came out as 917 GB. The startup log lists `convrot_w4a4` and
+`int8_tensorwise` under `Native ops`. The GPU drivers in the image are the ones from Intel's image,
+older than the host's (the card is reported as `Intel(R) Graphics [0xe223]`); no speed difference
+showed up. Not run in the container: the Turbo sampler node and MultiRef workflows (third-party
+nodes), and anything without `--privileged`.
 
 ## Switches
 
