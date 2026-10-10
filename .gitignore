@@ -4,3 +4,6 @@ __pycache__/
 *.whl
 *.orig
 *.rej
+
+# local working notes, not published
+CLAUDE.md
