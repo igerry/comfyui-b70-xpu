@@ -66,7 +66,7 @@ Arc Pro B70（32 GB）上实际在用的方案：ComfyUI 上游最新版 + torch
 ```bash
 git clone https://github.com/igerry/comfyui-b70-xpu.git
 cd comfyui-b70-xpu/omni
-bash build.sh                 # 得到 comfyui-b70-xpu:0.2.0-b1.1-comfyui-bmg
+bash build.sh                 # 得到 comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 ```
 
 构建过程：拉取 `intel/llm-scaler-omni:0.2.0-b1`，加装 Python 3.13 和 `torch 2.13.0+xpu`，
@@ -77,7 +77,7 @@ bash build.sh                 # 得到 comfyui-b70-xpu:0.2.0-b1.1-comfyui-bmg
 先验证，再运行。挂载点和参数与官方镜像相同：
 
 ```bash
-IMAGE=comfyui-b70-xpu:0.2.0-b1.1-comfyui-bmg
+IMAGE=comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 
 docker run --rm --device=/dev/dri "$IMAGE" /llm/entrypoints/validate_comfyui_image.sh
 
@@ -418,7 +418,8 @@ omni/
 ## 发布
 
 发布方式照官方的惯例：一个版本号、一个 git 标签 `omni-<版本号>`、一个 Docker 镜像。
-`0.2.0-b1.1` 的意思是「建在官方 `0.2.0-b1` 之上的第一个修订」。见 [Releases.md](Releases.md)。
+版本号是我们自己的，和官方的编号无关；每个版本会写明它建在哪个官方镜像之上
+（`0.1.0-b1` 建在 `intel/llm-scaler-omni:0.2.0-b1` 之上）。见 [Releases.md](Releases.md)。
 
 ## 许可和致谢
 

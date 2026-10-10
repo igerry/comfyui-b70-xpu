@@ -71,7 +71,7 @@ about 45 GB of free disk (Intel's base image is 21 GB), internet access during t
 ```bash
 git clone https://github.com/igerry/comfyui-b70-xpu.git
 cd comfyui-b70-xpu/omni
-bash build.sh                 # -> comfyui-b70-xpu:0.2.0-b1.1-comfyui-bmg
+bash build.sh                 # -> comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 ```
 
 The build pulls `intel/llm-scaler-omni:0.2.0-b1`, adds Python 3.13 with `torch 2.13.0+xpu`,
@@ -82,7 +82,7 @@ the Kitchen XPU backend and the `ComfyUI-OmniXPU` node. Intel's original stack s
 Validate, then run. Mount points and flags are the same as for Intel's image:
 
 ```bash
-IMAGE=comfyui-b70-xpu:0.2.0-b1.1-comfyui-bmg
+IMAGE=comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 
 docker run --rm --device=/dev/dri "$IMAGE" /llm/entrypoints/validate_comfyui_image.sh
 
@@ -441,7 +441,8 @@ omni/
 ## Releases
 
 Releases follow Intel's convention: a version, a git tag `omni-<version>`, and a Docker image.
-`0.2.0-b1.1` means "first revision on top of Intel's `0.2.0-b1`". See [Releases.md](Releases.md).
+Version numbers are our own and independent of Intel's; each release states which Intel image it
+is built on (`0.1.0-b1` is built on `intel/llm-scaler-omni:0.2.0-b1`). See [Releases.md](Releases.md).
 
 ## Licence and credits
 
