@@ -112,5 +112,7 @@ without it, on this LXC host, it came out as 917 GB. The startup log lists `conv
 older than the host's (the card is reported as `Intel(R) Graphics [0xe223]`); no speed difference
 showed up. The image published on Docker Hub is a later build of the same content split into 17
 layers; it passed the validator and one job per model (H3 55.8 s new seed) before it was pushed.
+After publication it was pulled anonymously onto a machine with no local copy (all 17 layers
+downloaded, 4.05 GB, same digest) and passed the validator again.
 Not run in the container: the Turbo sampler node and MultiRef workflows (third-party
 nodes), and anything without `--privileged`.

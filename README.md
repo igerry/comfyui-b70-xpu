@@ -64,7 +64,7 @@ numbers (H3 55.1 – 55.7 s vs. 55.7 – 56.0 s, and likewise for the other thre
 **Requirements:** Linux, an Intel Arc B-series GPU with working drivers, Docker.
 
 ```bash
-# 1. Pull (10.8 GB in 17 layers, about 5.5 GB to download)
+# 1. Pull (10.8 GB in 17 layers, 4.05 GB to download)
 docker pull gerrywang/comfyui-b70-xpu:0.1.0-b1
 
 # 2. Validate: kernels load, GPU is visible, INT8 is native

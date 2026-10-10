@@ -63,7 +63,7 @@ Intel 官方给 Arc 显卡做的 ComfyUI 镜像（[`intel/llm-scaler-omni`](http
 **要求：** Linux，Intel Arc B 系列显卡且驱动正常，装有 Docker。
 
 ```bash
-# 1. 拉取（10.8 GB，17 层，下载量约 5.5 GB）
+# 1. 拉取（10.8 GB，17 层，下载量 4.05 GB）
 docker pull gerrywang/comfyui-b70-xpu:0.1.0-b1
 
 # 2. 验收：算子能加载、显卡可见、INT8 是原生格式
