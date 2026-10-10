@@ -64,6 +64,7 @@ sudo docker run -itd \
     --device=/dev/dri \
     --network=host \
     --shm-size=16g \
+    --memory=96g \
     \
     --name="$CONTAINER_NAME" \
     -v "$COMFYUI_MODEL_DIR":/models/host:ro \
@@ -90,6 +91,9 @@ Notes:
 
 - All our runs added `--privileged` (the test host is an LXC container and needs it). Without it the
   image is untested, pinned memory in particular.
+- **Inside an LXC container add `--memory=<LXC memory size>`, for example `--memory=96g`.** Docker
+  nested in LXC sees the physical host's RAM, so the pinned-memory budget (90% of RAM) is computed
+  from the wrong number. ComfyUI honours the cgroup limit set by `--memory`.
 - Pinned host memory is on by default and keeps a page-locked copy of every loaded model (up to
   90% of host RAM). Disable it with `-e OMNIXPU_PIN_MEMORY=0` on hosts with less than about 64 GB.
 - DynamicVRAM (`--enable-dynamic-vram`) is not used: on XPU it is the slowest way to run a

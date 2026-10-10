@@ -82,7 +82,7 @@ IMAGE=comfyui-b70-xpu:0.2.0-b1.1-comfyui-bmg
 docker run --rm --device=/dev/dri "$IMAGE" /llm/entrypoints/validate_comfyui_image.sh
 
 docker run -itd --name comfyui \
-    --device=/dev/dri --network=host --shm-size=16g \
+    --device=/dev/dri --network=host --shm-size=16g --memory=96g \
     -v /path/to/comfyui_models:/models/host:ro \
     -v /path/to/comfyui_input:/data/input \
     -v /path/to/comfyui_output:/data/output \
@@ -90,11 +90,18 @@ docker run -itd --name comfyui \
     "$IMAGE"
 ```
 
+`--memory` 填 ComfyUI 可以指望的内存：物理机的内存；Docker 跑在 LXC 里时填 LXC 的内存大小
+（测试机是 96 GB）。
+
 之后访问 `http://<主机>:8188`。默认命令是 `/llm/entrypoints/start_comfyui.sh`
 （直接启动；跟在它后面的参数会传给 `main.py`）。也可以像用官方镜像那样自己写 `python main.py ...`。
 
 - 我们实际运行时多加了 `--privileged`（测试机是 LXC 容器，必须加；官方早先的说明也是这么写的）。
   不加 `--privileged` 的情况没有测过，尤其是锁页内存。
+- **在 LXC 里运行时，要把 LXC 的内存大小传给容器：`--memory=96g`**（换成你自己 LXC 的值）。
+  嵌套在 LXC 里的 Docker 看到的是物理机的内存，不是 LXC 的限额：在我们的机器上，锁页内存预算
+  被算成了 917 GB，而不是 86 GB。ComfyUI 认 `--memory` 设下的 cgroup 限额，预算会变成这个值的 90%。
+  直接跑在物理机或普通虚拟机上不需要这一条。
 - **主机内存。** 锁页内存会给每个加载过的模型保留一份锁页副本，上限是内存的 90%。
   只跑 H3 就要约 52 GB，测试机是 96 GB。内存不够就加 `-e OMNIXPU_PIN_MEMORY=0`。
 - **自定义节点。** 把单个节点挂到 `/llm/ComfyUI/custom_nodes/<名字>`；不要整个目录覆盖挂载，

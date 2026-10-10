@@ -87,7 +87,7 @@ IMAGE=comfyui-b70-xpu:0.2.0-b1.1-comfyui-bmg
 docker run --rm --device=/dev/dri "$IMAGE" /llm/entrypoints/validate_comfyui_image.sh
 
 docker run -itd --name comfyui \
-    --device=/dev/dri --network=host --shm-size=16g \
+    --device=/dev/dri --network=host --shm-size=16g --memory=96g \
     -v /path/to/comfyui_models:/models/host:ro \
     -v /path/to/comfyui_input:/data/input \
     -v /path/to/comfyui_output:/data/output \
@@ -95,12 +95,19 @@ docker run -itd --name comfyui \
     "$IMAGE"
 ```
 
+`--memory` is the RAM ComfyUI may count on: the machine's RAM, or the LXC container's memory size
+when Docker runs inside LXC (96 GB on the test machine).
+
 ComfyUI is then on `http://<host>:8188`. The default command is
 `/llm/entrypoints/start_comfyui.sh` (a direct start; arguments after it go to `main.py`). You can
 also run `python main.py ...` yourself, exactly as with Intel's image.
 
 - We ran it with `--privileged` added (our host is an LXC container and needs it; it is also what Intel's
   older instructions use). Without `--privileged` the image is untested, pinned memory in particular.
+- **Inside LXC, pass the LXC's memory size: `--memory=96g`** (use your container's value). Docker
+  nested in an LXC container reports the physical host's RAM, not the LXC limit: on our machine
+  the pinned-memory budget came out as 917 GB instead of 86 GB. ComfyUI honours the cgroup limit
+  that `--memory` sets, so the budget becomes 90% of that value. On a plain host this is not needed.
 - **Host RAM.** Pinned memory keeps a page-locked copy of every model that has been loaded, up to
   90% of RAM. H3 alone needs about 52 GB. The test machine has 96 GB. With less, add
   `-e OMNIXPU_PIN_MEMORY=0`.
