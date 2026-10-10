@@ -4,7 +4,7 @@
 
 **Current ComfyUI on an Intel Arc Pro B70, with the fast paths actually in use.**
 
-[![Release](https://img.shields.io/badge/release-0.1.0--b1-2f81f7)](Releases.md)
+[![Release](https://img.shields.io/badge/release-0.1.0--b1-2f81f7)](https://github.com/igerry/comfyui-b70-xpu/releases/tag/omni-0.1.0-b1)
 [![Docker](https://img.shields.io/badge/docker-gerrywang%2Fcomfyui--b70--xpu-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/gerrywang/comfyui-b70-xpu/tags)
 [![Image size](https://img.shields.io/badge/image-10.8%20GB-informational)](omni/docs/IMAGE_BUILD.md)
 [![ComfyUI](https://img.shields.io/badge/ComfyUI-0.39.0-8A2BE2)](https://github.com/comfyanonymous/ComfyUI)
