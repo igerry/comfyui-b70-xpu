@@ -1,0 +1,10 @@
+--- scaled_mm_v2.py	2026-09-05 00:41:12.034257511 +0000
++++ scaled_mm_v2.py	2026-09-05 00:14:24.392610201 +0000
+@@ -1,6 +1,7 @@
+ from typing import Optional
+ 
+ import torch
++
+ from packaging import version
+ 
+ _TORCH_VERSION = version.parse(torch.__version__.split("+")[0])  # Remove git hash suffix

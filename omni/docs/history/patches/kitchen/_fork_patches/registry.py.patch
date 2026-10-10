@@ -1,0 +1,77 @@
+--- registry.py	2026-09-05 00:41:12.034155196 +0000
++++ registry.py	2026-09-05 00:14:24.392483792 +0000
+@@ -22,7 +22,7 @@
+         self._backends = {}  # {name: backend_module}
+         self._capabilities = {}  # {name: set of function names}
+         self._constraints = {}  # {(backend_name, func_name): FunctionConstraints}
+-        self._priority = ["cuda", "triton", "eager"]
++        self._priority = ["xpu", "triton", "eager"]
+         self._disabled = set()  # Manually disabled backends
+         self._unavailable = {}  # {name: error_message} for failed backends
+         self._lock = threading.Lock()
+@@ -112,6 +112,10 @@
+         """
+         return backend_name in self._backends and backend_name not in self._disabled
+ 
++    def get_backend_override(self) -> str | None:
++        """Return the active thread-local backend override, if any."""
++        return getattr(self._thread_local, "backend_override", None)
++
+     def list_backends(self) -> dict:
+         """Return dict of all backends with their status.
+ 
+@@ -195,7 +199,10 @@
+             NoCapableBackendError: If no backend can handle the call
+         """
+         failures: dict[str, str] = {}
+-        validate = bool(kwargs)  # Skip validation if kwargs is empty/None
++        # Avoid Mapping truth-value conversion here. TorchDynamo represents the
++        # operator kwargs as a ConstDictVariable and cannot compile bool(kwargs)
++        # in fullgraph mode, while len() preserves the same empty/None contract.
++        validate = kwargs is not None and len(kwargs) != 0
+ 
+         # Check for thread-local override first
+         override = getattr(self._thread_local, "backend_override", None)
+@@ -207,11 +214,21 @@
+             elif validate:
+                 result = self.validate_backend_for_call(override, func_name, kwargs)
+                 if result.success:
+-                    logger.debug("Backend %s selected for %s (override)", override, func_name)
++                    if not torch.compiler.is_compiling():
++                        logger.debug(
++                            "Backend %s selected for %s (override)",
++                            override,
++                            func_name,
++                        )
+                     return override
+                 failures[override] = f"{result.failed_param}: {result.failure_reason}"
+             else:
+-                logger.debug("Backend %s selected for %s (override)", override, func_name)
++                if not torch.compiler.is_compiling():
++                    logger.debug(
++                        "Backend %s selected for %s (override)",
++                        override,
++                        func_name,
++                    )
+                 return override
+ 
+         # Try backends in priority order
+@@ -227,7 +244,8 @@
+                     failures[backend_name] = f"{result.failed_param}: {result.failure_reason}"
+                     continue
+ 
+-            logger.debug("Backend %s selected for %s", backend_name, func_name)
++            if not torch.compiler.is_compiling():
++                logger.debug("Backend %s selected for %s", backend_name, func_name)
+             return backend_name
+ 
+         raise NoCapableBackendError(func_name, failures)
+@@ -260,7 +278,7 @@
+                 raise BackendNotFoundError(backend, "disabled")
+             if func_name not in self._capabilities.get(backend, set()):
+                 raise BackendNotImplementedError(backend, func_name)
+-            if kwargs:
++            if kwargs is not None and len(kwargs) != 0:
+                 result = self.validate_backend_for_call(backend, func_name, kwargs)
+                 if not result.success:
+                     raise NoCapableBackendError(func_name, {backend: f"{result.failed_param}: {result.failure_reason}"})

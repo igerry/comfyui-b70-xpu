@@ -1,0 +1,1034 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/__init__.py b/ComfyUI-OmniXPU/__init__.py
+--- a/ComfyUI-OmniXPU/__init__.py	2026-07-23 09:11:55.000000000 +0000
++++ b/ComfyUI-OmniXPU/__init__.py	2026-10-09 09:38:32.742645801 +0000
+@@ -44,6 +44,71 @@
+         config_mod = sys.modules[f"{_PKG}.config"]
+         patches.apply_all_patches(config_mod.config)
+ 
++        # 2026-10-09: ComfyUI 0.39 treats INT8 as emulated on XPU unless told otherwise.
++        # OMNIXPU_INT8_COMPUTE=0 disables.
++        try:
++            i8fix = _load("fixes/xpu_int8_compute.py", f"{_PKG}.fixes.xpu_int8_compute")
++            ok, why = i8fix.apply()
++            if not ok:
++                log.info("[OmniXPU] XPU INT8 compute not enabled: %s", why)
++        except Exception as e:
++            log.warning("[OmniXPU] XPU INT8 compute fix failed: %s", e)
++
++        # Phase-1 (2026-09-05): pinned host memory for model offload on XPU
++        # (ComfyUI only enables it for CUDA/ROCm). OMNIXPU_PIN_MEMORY=0 disables.
++        try:
++            pinfix = _load("fixes/xpu_pinned_memory.py", f"{_PKG}.fixes.xpu_pinned_memory")
++            ok, why = pinfix.apply()
++            if not ok:
++                log.info("[OmniXPU] XPU pinned memory not enabled: %s", why)
++        except Exception as e:
++            log.warning("[OmniXPU] XPU pinned memory fix failed: %s", e)
++
++        # Phase-2 (2026-09-06): H3 DiTBlock RMSNorm with fused AdaLN scale/shift. OMNIXPU_ADALN_FUSED=0 disables.
++        try:
++            adfix = _load("fixes/h3_adaln_fused.py", f"{_PKG}.fixes.h3_adaln_fused")
++            ok, why = adfix.apply()
++            if not ok:
++                log.info("[OmniXPU] fused AdaLN not enabled: %s", why)
++        except Exception as e:
++            log.warning("[OmniXPU] fused AdaLN fix failed: %s", e)
++
++        # Phase-2 (2026-09-06): whole-block producer-fused INT8 path. OMNIXPU_BLOCK_FUSED=0 disables.
++        try:
++            bfix = _load("fixes/h3_block_fused.py", f"{_PKG}.fixes.h3_block_fused")
++            ok, why = bfix.apply()
++            if not ok:
++                log.info("[OmniXPU] block fusion not enabled: %s", why)
++        except Exception as e:
++            log.warning("[OmniXPU] block fusion fix failed: %s", e)
++
++        # 2026-10-09: Music 3 condition windows as one batch. OMNIXPU_MUSIC3_BATCH=0 disables.
++        try:
++            m3fix = _load("fixes/music3_window_batch.py", f"{_PKG}.fixes.music3_window_batch")
++            ok, why = m3fix.apply()
++            if not ok:
++                log.info("[OmniXPU] Music 3 window batching not enabled: %s", why)
++        except Exception as e:
++            log.warning("[OmniXPU] Music 3 window batching fix failed: %s", e)
++
++        # 2026-10-09: Music 3 partial RoPE on dense q/k. OMNIXPU_MUSIC3_ROPE=0 disables.
++        try:
++            m3rope = _load("fixes/music3_rope_dense.py", f"{_PKG}.fixes.music3_rope_dense")
++            ok, why = m3rope.apply()
++            if not ok:
++                log.info("[OmniXPU] Music 3 dense RoPE not enabled: %s", why)
++        except Exception as e:
++            log.warning("[OmniXPU] Music 3 dense RoPE fix failed: %s", e)
++
++        # 2026-10-09: Music 3 GLU gate fused into the INT8 down-projection. OMNIXPU_MUSIC3_GLU=0 disables.
++        try:
++            m3glu = _load("fixes/music3_glu_fused.py", f"{_PKG}.fixes.music3_glu_fused")
++            ok, why = m3glu.apply()
++            if not ok:
++                log.info("[OmniXPU] Music 3 fused GLU not enabled: %s", why)
++        except Exception as e:
++            log.warning("[OmniXPU] Music 3 fused GLU fix failed: %s", e)
++
+         # Load diagnostics node
+         _load("nodes/__init__.py", f"{_PKG}.nodes")
+         diag = _load("nodes/diagnostics.py", f"{_PKG}.nodes.diagnostics")
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/adapters/attention.py b/ComfyUI-OmniXPU/adapters/attention.py
+--- a/ComfyUI-OmniXPU/adapters/attention.py	2026-08-10 07:10:23.000000000 +0000
++++ b/ComfyUI-OmniXPU/adapters/attention.py	2026-10-09 09:54:36.628329267 +0000
+@@ -105,6 +105,9 @@
+     return "unknown"
+ 
+ 
++_TRACE_CONTRACTS = os.environ.get("OMNI_ATTN_TRACE_CONTRACTS", "0") in {"1", "true", "yes"}
++
++
+ def _trace_attention_contract(
+     q,
+     k,
+@@ -114,11 +117,7 @@
+     skip_reshape,
+     skip_output_reshape,
+ ):
+-    if os.environ.get("OMNI_ATTN_TRACE_CONTRACTS", "0") not in {
+-        "1",
+-        "true",
+-        "yes",
+-    }:
++    if not _TRACE_CONTRACTS:
+         return
+     contract = (
+         _attention_tensor_contract(q),
+@@ -156,7 +155,23 @@
+     )
+ 
+ 
++# Torch minors this adapter may route to CUTE on. Upstream pins (2, 11); the
++# kernels are built against the running torch, so its minor is allowed too.
++_OMNI_TORCH_MINORS = {(2, 11), (2, 12), (2, 13), (2, 14)}
++
++
++_torch_major_minor_cache = None
++
++
+ def _torch_major_minor():
++    # Phase-1: memoized; was re-parsing torch.__version__ 4-5x per attention call.
++    global _torch_major_minor_cache
++    if _torch_major_minor_cache is None:
++        _torch_major_minor_cache = _torch_major_minor_uncached()
++    return _torch_major_minor_cache
++
++
++def _torch_major_minor_uncached():
+     try:
+         components = torch.__version__.split("+", 1)[0].split(".")
+         return int(components[0]), int(components[1])
+@@ -164,7 +179,18 @@
+         return None
+ 
+ 
++_omni_xpu_target_cache = (False, None)
++
++
+ def _omni_xpu_target():
++    # Phase-1: memoized; was importing omni_xpu_kernel + getattr up to 5x per call.
++    global _omni_xpu_target_cache
++    if not _omni_xpu_target_cache[0]:
++        _omni_xpu_target_cache = (True, _omni_xpu_target_uncached())
++    return _omni_xpu_target_cache[1]
++
++
++def _omni_xpu_target_uncached():
+     try:
+         import omni_xpu_kernel as pkg
+ 
+@@ -189,7 +215,7 @@
+         _backend == "auto"
+         and _backend_name == "cute"
+         and _omni_xpu_target() == "ptl-h"
+-        and _torch_major_minor() == (2, 11)
++        and _torch_major_minor() in _OMNI_TORCH_MINORS
+         and q.dtype == torch.bfloat16
+         and dim_head == 128
+         and q_len == kv_len
+@@ -266,7 +292,7 @@
+     return (
+         _backend_name == "cute"
+         and _omni_xpu_target() == "bmg"
+-        and _torch_major_minor() == (2, 11)
++        and _torch_major_minor() in _OMNI_TORCH_MINORS
+         and callable(capability)
+         and capability()
+         and q.dtype == torch.float16
+@@ -304,7 +330,7 @@
+         _backend == "auto"
+         and _backend_name == "cute"
+         and _omni_xpu_target() in ("ptl-h", "bmg")
+-        and _torch_major_minor() == (2, 11)
++        and _torch_major_minor() in _OMNI_TORCH_MINORS
+         and callable(capability)
+         and capability()
+         and q.dtype == torch.float16
+@@ -407,6 +433,21 @@
+     )
+ 
+ 
++def _is_qwen_image21_cute_shape(b, heads, dim_head, q_len, kv_len, dtype):
++    """Qwen-Image 2.1 image rows attending to prefix + image rows; see patch_attn_qwen21_cute.py."""
++    if os.environ.get("OMNIXPU_QWEN21_CUTE", "1").strip().lower() in ("", "0", "false", "no", "off"):
++        return False
++    return (
++        b == 1
++        and heads == 32
++        and dim_head == 128
++        and dtype == torch.bfloat16
++        and q_len < kv_len
++        and q_len >= 1024
++        and kv_len >= int(os.environ.get("OMNIXPU_QWEN21_CUTE_MIN_KV", "7168"))
++    )
++
++
+ def _prepare_bmg_d128_bhld_cute(
+     q,
+     k,
+@@ -439,11 +480,12 @@
+         or (b == 1 and cross_attention)
+         or minimax_h3_attention
+         or animate2_attention
++        or _is_qwen_image21_cute_shape(b, heads, dim_head, q_len, kv_len, q.dtype)
+     )
+     if not (
+         _backend_name == "cute"
+         and _omni_xpu_target() == "bmg"
+-        and _torch_major_minor() == (2, 11)
++        and _torch_major_minor() in _OMNI_TORCH_MINORS
+         and callable(capability)
+         and capability()
+         and (
+@@ -516,7 +558,7 @@
+     return (
+         _backend_name == "cute"
+         and _omni_xpu_target() == "bmg"
+-        and _torch_major_minor() == (2, 11)
++        and _torch_major_minor() in _OMNI_TORCH_MINORS
+         and callable(capability)
+         and capability()
+         and q.dtype == torch.float16
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/adapters/norm.py b/ComfyUI-OmniXPU/adapters/norm.py
+--- a/ComfyUI-OmniXPU/adapters/norm.py	2026-07-27 06:37:33.000000000 +0000
++++ b/ComfyUI-OmniXPU/adapters/norm.py	2026-09-05 03:59:29.857726931 +0000
+@@ -18,6 +18,8 @@
+ _omni_norm = None
+ _logged_first_use = False
+ _allow_noncontiguous_rms = False
++_strict_noncontiguous_views = os.environ.get("OMNIXPU_NORM_STRICT_VIEWS", "0") == "1"
++_ones_weight_cache = {}
+ _allow_h120_rms = False
+ _allow_bmg_group_norm = False
+ _bmg_group_norm_shapes = {
+@@ -92,13 +94,19 @@
+         # to make one dense copy and then use the ESIMD RMSNorm kernel. Keep
+         # other targets on their fallback until they receive their own
+         # workflow A/B.
+-        if (
+-            not _allow_noncontiguous_rms
+-            or x.ndim != 4
++        # Phase-1 (2026-09-05): generalized. The H3 VideoVAE q/k are (1,L,32,64)
++        # fp16 chunks of a packed (1,L,32,192) qkv (gap per head, not per token)
++        # and were rejected by the Lumina-only shape test, sending 7560 calls per
++        # 480p decode to torch's decomposed RMSNorm. One dense copy (~7 MB) plus
++        # the ESIMD kernel measured 0.21 ms vs 0.33 ms for the fallback.
++        # OMNIXPU_NORM_STRICT_VIEWS=1 restores the original Lumina-only rule.
++        if not _allow_noncontiguous_rms or x.stride(-1) != 1:
++            return None
++        if _strict_noncontiguous_views and (
++            x.ndim != 4
+             or x.shape[0] != 1
+             or x.shape[2] != 30
+             or h != 128
+-            or x.stride(-1) != 1
+             or x.stride(2) != h
+             or x.stride(1) != 3 * x.shape[2] * h
+             or x.stride(0) != x.shape[1] * x.stride(1)
+@@ -323,7 +331,11 @@
+                 if weight is not None:
+                     w = comfy.model_management.cast_to(weight, dtype=x.dtype, device=x.device)
+                 else:
+-                    w = torch.ones(orig[-1], dtype=x.dtype, device=x.device)
++                    key = (orig[-1], x.dtype, x.device)
++                    w = _ones_weight_cache.get(key)
++                    if w is None:
++                        w = torch.ones(orig[-1], dtype=x.dtype, device=x.device)
++                        _ones_weight_cache[key] = w
+                 return _run_rms_norm(w, x_2d, eps).reshape(orig)
+             return _orig_rms_fn(x, weight=weight, eps=eps)
+ 
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/fixes/h3_adaln_fused.py b/ComfyUI-OmniXPU/fixes/h3_adaln_fused.py
+--- a/ComfyUI-OmniXPU/fixes/h3_adaln_fused.py	1970-01-01 00:00:00.000000000 +0000
++++ b/ComfyUI-OmniXPU/fixes/h3_adaln_fused.py	2026-10-09 05:45:39.564078082 +0000
+@@ -0,0 +1,94 @@
++"""H3 DiTBlock: fuse the AdaLN scale/shift into the RMSNorm kernel (2026-09-06).
++
++Stock: norm -> bf16, then per segment h[a:b].mul_(1+scale[row]).add_(shift[row]) = two more full
++passes over (M, 5376) per norm, 3.9 ms per block for the two norms. rms_norm_mod applies the
++modulation inside the normalize pass. Only the plain-int segment form is fused; per-token index
++tensors (non-uniform denoise masks) fall back to the stock path. OMNIXPU_ADALN_FUSED=0 disables.
++Deployed as ComfyUI-OmniXPU/fixes/h3_adaln_fused.py.
++"""
++import logging
++import os
++
++import torch
++
++log = logging.getLogger("ComfyUI-OmniXPU")
++_applied = False
++
++
++def apply():
++    global _applied
++    if _applied:
++        return True, "already applied"
++    if os.environ.get("OMNIXPU_ADALN_FUSED", "1") == "0":
++        return False, "disabled by OMNIXPU_ADALN_FUSED=0"
++    try:
++        import comfy.ldm.minimax.model as h3
++        import comfy.model_management
++        from omni_xpu_kernel import norm as onorm
++    except ImportError as e:
++        return False, f"import failed: {e}"
++    native = onorm._get_native()
++    if native is None or not hasattr(native, "rms_norm_mod"):
++        return False, "omni_xpu_kernel has no rms_norm_mod"
++
++    _orig_forward = h3.DiTBlock.forward
++    _seg_cache = {}
++    stats = {"fused": 0, "fallback": 0}
++
++    def _segments(mod_segments, rows, device):
++        key = (tuple((a, b, int(r)) for a, b, r in mod_segments), rows, str(device))
++        t = _seg_cache.get(key)
++        if t is None:
++            ends = [b for _, b, _ in mod_segments]
++            mods = [int(r) for _, _, r in mod_segments]
++            if len(ends) > 8 or ends != sorted(ends) or ends[-1] != rows or mod_segments[0][0] != 0:
++                return None
++            while len(ends) < 8:
++                ends.append(rows)
++                mods.append(mods[-1])
++            t = (torch.tensor(ends, dtype=torch.int32, device=device),
++                 torch.tensor(mods, dtype=torch.int32, device=device))
++            if len(_seg_cache) > 64:
++                _seg_cache.clear()
++            _seg_cache[key] = t
++        return t
++
++    def _norm_mod(norm, x, scale, shift, seg):
++        w = comfy.model_management.cast_to(norm.weight, dtype=x.dtype, device=x.device)
++        return native.rms_norm_mod(
++            w.contiguous(), x, scale.to(x.dtype).contiguous(), shift.to(x.dtype).contiguous(),
++            seg[0], seg[1], float(norm.eps))
++
++    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):
++        try:
++            if (
++                attention is None and
++                x.dim() == 2 and x.dtype == torch.bfloat16 and x.device.type == "xpu" and x.is_contiguous()
++                and x.shape[1] % 64 == 0
++                and all(isinstance(r, int) for _, _, r in mod_segments)
++                and getattr(self.norm1, "weight", None) is not None
++                and not getattr(self.norm1, "weight_function", None)
++            ):
++                seg = _segments(mod_segments, x.shape[0], x.device)
++                if seg is not None:
++                    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
++                    h = _norm_mod(self.norm1, x, scale_msa, shift_msa, seg)
++                    x = h3._mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs,
++                                                            transformer_options=transformer_options), mod_segments)
++                    h = _norm_mod(self.norm2, x, scale_mlp, shift_mlp, seg)
++                    stats["fused"] += 1
++                    return h3._mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
++        except Exception as e:  # noqa: BLE001
++            if stats["fallback"] == 0:
++                log.warning("[OmniXPU] fused AdaLN path failed, using stock DiTBlock: %s", e)
++        stats["fallback"] += 1
++        if attention is not None:
++            return _orig_forward(self, x, t_emb, mod_segments, rope_freqs,
++                                 transformer_options=transformer_options, attention=attention)
++        return _orig_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
++
++    h3.DiTBlock.forward = forward
++    forward.stats = stats
++    _applied = True
++    log.info("[OmniXPU] H3 DiTBlock fused RMSNorm+AdaLN enabled")
++    return True, None
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/fixes/h3_block_fused.py b/ComfyUI-OmniXPU/fixes/h3_block_fused.py
+--- a/ComfyUI-OmniXPU/fixes/h3_block_fused.py	1970-01-01 00:00:00.000000000 +0000
++++ b/ComfyUI-OmniXPU/fixes/h3_block_fused.py	2026-10-09 14:51:49.075721927 +0000
+@@ -0,0 +1,178 @@
++"""H3 DiTBlock with producer-fused INT8 activations (2026-09-06).
++
++Per block the stock chain materializes bf16 (M, 5376) tensors between addcmul_ (gated residual),
++RMSNorm+AdaLN, Hadamard rotation and INT8 quantization -- twice -- and a bf16 (M, 14336) between
++SiLU*mul and fc2's quantization. This module runs:
++  norm1 -> int8              rms_norm_mod_convrot_quant(x)                     -> qkv GEMM (prequantized)
++  x += gate*attn; norm2 -> int8  rms_norm_mod_convrot_quant(x, attn_out, gate) -> fc1 GEMM (prequantized)
++  fc2 with the fused SiLU*mul+rotate+quantize producer (int8_linear input_act="swiglu")
++Falls back to the stock forward when any weight is not a convrot INT8 QuantizedTensor on the
++device or when a segment uses per-token indices. OMNIXPU_BLOCK_FUSED=0 disables.
++Deployed as ComfyUI-OmniXPU/fixes/h3_block_fused.py (supersedes h3_adaln_fused.py when active).
++"""
++import logging
++import os
++
++import torch
++
++log = logging.getLogger("ComfyUI-OmniXPU")
++_applied = False
++
++
++def apply():
++    global _applied
++    if _applied:
++        return True, "already applied"
++    if os.environ.get("OMNIXPU_BLOCK_FUSED", "1") == "0":
++        return False, "disabled by OMNIXPU_BLOCK_FUSED=0"
++    try:
++        import comfy.ldm.minimax.model as h3
++        import comfy.model_management
++        import comfy.ops
++        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
++        from omni_xpu_kernel import int8 as oint8
++    except ImportError as e:
++        return False, f"import failed: {e}"
++    native = oint8._get_native()
++    for name in ("rms_norm_mod_convrot_quant", "quantize_int8_convrot_silu_mul_split", "int8_linear_prequantized"):
++        if native is None or not hasattr(native, name):
++            return False, f"omni_xpu_kernel has no {name}"
++    split = int(os.environ.get("OMNIXPU_BLOCK_FUSED_SPLIT", "8"))
++
++    _orig_forward = h3.DiTBlock.forward
++    _seg_cache = {}
++    stats = {"fused": 0, "fallback": 0}
++    reasons = {}
++    debug = os.environ.get("OMNIXPU_BLOCK_FUSED_DEBUG", "0") == "1"
++
++    def _why(linear, device):
++        w = getattr(linear, "weight", None)
++        if not isinstance(w, QuantizedTensor): return "not_quantized:" + type(w).__name__
++        if w._layout_cls != "TensorWiseINT8Layout": return "layout:" + str(w._layout_cls)
++        if not getattr(w._params, "convrot", False): return "no_convrot"
++        if w.device != device: return "weight_on:" + str(w.device)
++        if getattr(linear, "bias", None) is not None: return "has_bias"
++        return "other"
++
++    def _note(reason):
++        reasons[reason] = reasons.get(reason, 0) + 1
++
++    def _tick():
++        n = stats["fused"] + stats["fallback"]
++        if debug and n % 300 == 0:
++            log.info("[OmniXPU] block_fused tally after %d calls: fused=%d fallback=%d reasons=%s", n, stats["fused"], stats["fallback"], dict(reasons))
++
++    def _segments(mod_segments, rows, device):
++        key = (tuple((a, b, int(r)) for a, b, r in mod_segments), rows, str(device))
++        t = _seg_cache.get(key)
++        if t is None:
++            ends = [b for _, b, _ in mod_segments]
++            mods = [int(r) for _, _, r in mod_segments]
++            if len(ends) > 8 or ends != sorted(ends) or ends[-1] != rows or mod_segments[0][0] != 0:
++                return None
++            while len(ends) < 8:
++                ends.append(rows)
++                mods.append(mods[-1])
++            t = (torch.tensor(ends, dtype=torch.int32, device=device),
++                 torch.tensor(mods, dtype=torch.int32, device=device))
++            if len(_seg_cache) > 64:
++                _seg_cache.clear()
++            _seg_cache[key] = t
++        return t
++
++    def _plain(linear, device):
++        w = getattr(linear, "weight", None)
++        if not (isinstance(w, QuantizedTensor) and w._layout_cls == "TensorWiseINT8Layout"
++                and getattr(w._params, "convrot", False) and w.device == device
++                and getattr(linear, "bias", None) is None
++                and int(getattr(w._params, "convrot_groupsize", 256)) == 256):
++            return None
++        q, s = TensorWiseINT8Layout.get_plain_tensors(w)
++        if q.dim() != 2 or not q.is_contiguous():
++            return None
++        return q, s.reshape(-1)
++
++    def _norm_w(norm, x):
++        return comfy.model_management.cast_to(norm.weight, dtype=x.dtype, device=x.device).contiguous()
++
++    def _attn(attn, h_int8, h_scale, s, qkv_w, rope_freqs, transformer_options, x):
++        H, D = attn.heads, attn.head_dim
++        qkv = native.int8_linear_prequantized(h_int8, h_scale, qkv_w[0], qkv_w[1], None, 2)
++        q, k, v = qkv.split(H * D, dim=-1)
++        v = v.view(s, H, D)
++        if rope_freqs is not None:
++            q = q.view(1, s, H, D)
++            k = k.view(1, s, H, D)
++            qw = comfy.model_management.cast_to(attn.q_norm.weight, device=x.device)
++            kw = comfy.model_management.cast_to(attn.k_norm.weight, device=x.device)
++            rot = rope_freqs.shape[-3] * 2
++            if comfy.model_management.in_training:
++                q, k = comfy.quant_ops.ck.rms_rope_split_half(q, k, rope_freqs, qw, kw, epsilon=attn.q_norm.eps, rot_dim=rot)
++            else:
++                comfy.quant_ops.ck.rms_rope_split_half_(q, k, rope_freqs, qw, kw, epsilon=attn.q_norm.eps, rot_dim=rot)
++            q = q[0]
++            k = k[0]
++        else:
++            q = attn.q_norm(q.view(s, H, D))
++            k = attn.k_norm(k.view(s, H, D))
++        q = h3.AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
++        k = h3.AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
++        v = h3.AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
++        out = h3.optimized_attention(q, k, v, H, mask=None, skip_reshape=True, transformer_options=transformer_options)
++        return attn.out_proj(out.squeeze(0))
++
++    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):
++        try:
++            if (
++                attention is None and
++                x.dim() == 2 and x.dtype == torch.bfloat16 and x.device.type == "xpu" and x.is_contiguous()
++                and x.shape[1] % 256 == 0
++                and all(isinstance(r, int) for _, _, r in mod_segments)
++                and getattr(self.norm1, "weight", None) is not None
++                and not getattr(self.norm1, "weight_function", None)
++                and not getattr(self.norm2, "weight_function", None)
++            ):
++                seg = _segments(mod_segments, x.shape[0], x.device)
++                qkv_w = _plain(self.attn.qkv_proj, x.device)
++                fc1_w = _plain(self.mlp.fc1, x.device)
++                if seg is None: _note("segments")
++                elif qkv_w is None: _note("qkv:" + _why(self.attn.qkv_proj, x.device))
++                elif fc1_w is None: _note("fc1:" + _why(self.mlp.fc1, x.device))
++                if seg is not None and qkv_w is not None and fc1_w is not None:
++                    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
++                    dt = x.dtype
++                    h_i8, h_sc = native.rms_norm_mod_convrot_quant(
++                        x, None, None, _norm_w(self.norm1, x),
++                        scale_msa.to(dt).contiguous(), shift_msa.to(dt).contiguous(),
++                        seg[0], seg[1], float(self.norm1.eps), 256, split)
++                    attn_out = _attn(self.attn, h_i8, h_sc, x.shape[0], qkv_w, rope_freqs, transformer_options, x)
++                    del h_i8, h_sc
++                    attn_out = attn_out.contiguous()
++                    h2_i8, h2_sc = native.rms_norm_mod_convrot_quant(
++                        x, attn_out, gate_msa.to(dt).contiguous(), _norm_w(self.norm2, x),
++                        scale_mlp.to(dt).contiguous(), shift_mlp.to(dt).contiguous(),
++                        seg[0], seg[1], float(self.norm2.eps), 256, split)
++                    del attn_out
++                    f1 = native.int8_linear_prequantized(h2_i8, h2_sc, fc1_w[0], fc1_w[1], None, 2)
++                    del h2_i8, h2_sc
++                    mlp_out = comfy.ops.linear_input_act(self.mlp.fc2, f1, "swiglu")
++                    del f1
++                    stats["fused"] += 1
++                    _tick()
++                    return h3._mod_gate(x, gate_mlp, mlp_out, mod_segments)
++        except Exception as e:  # noqa: BLE001
++            _note("exception:" + type(e).__name__)
++            if stats["fallback"] == 0:
++                log.warning("[OmniXPU] fused DiTBlock path failed, using stock: %s", e)
++        stats["fallback"] += 1
++        _tick()
++        if attention is not None:
++            return _orig_forward(self, x, t_emb, mod_segments, rope_freqs,
++                                 transformer_options=transformer_options, attention=attention)
++        return _orig_forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
++
++    h3.DiTBlock.forward = forward
++    forward.stats = stats
++    _applied = True
++    log.info("[OmniXPU] H3 DiTBlock producer-fused INT8 path enabled (row_split=%d)", split)
++    return True, None
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/fixes/music3_glu_fused.py b/ComfyUI-OmniXPU/fixes/music3_glu_fused.py
+--- a/ComfyUI-OmniXPU/fixes/music3_glu_fused.py	1970-01-01 00:00:00.000000000 +0000
++++ b/ComfyUI-OmniXPU/fixes/music3_glu_fused.py	2026-10-09 09:38:32.723232778 +0000
+@@ -0,0 +1,105 @@
++"""MiniMax Music 3: GLU gate folded into the down-projection's INT8 quantizer (2026-10-09).
++
++Stock FeedForward is proj -> `value, gate = chunk(2)` -> value * silu(gate) -> Linear. With INT8
++ConvRot weights the down-projection then rotates and quantizes that product again. On XPU the
++chunk halves are strided views, so the gate multiply alone is 6.2 ms per layer at batch 58 x 690
++tokens (a third of the layer's non-GEMM time), plus the separate rotate+quantize pass.
++omni_xpu_kernel's quantize_int8_convrot_silu_mul_split does SiLU*mul + Hadamard + rowwise INT8 in
++one pass over the dense [M, 2K] proj output; phase-9 added gate_second=1 for Music 3's [up | gate]
++row order. The result goes straight to the prequantized INT8 GEMM.
++
++Only for INT8 ConvRot-256 down-projection weights resident on the XPU with no weight/bias
++functions attached (LoRA, lowvram streaming) and outside training; everything else, including a
++kernel without gate_second, takes the stock forward.
++OMNIXPU_MUSIC3_GLU=0 disables. Deployed as ComfyUI-OmniXPU/fixes/music3_glu_fused.py.
++"""
++import logging
++import os
++
++import torch
++
++log = logging.getLogger("ComfyUI-OmniXPU")
++_applied = False
++
++
++def apply():
++    global _applied
++    if _applied:
++        return True, "already applied"
++    if os.environ.get("OMNIXPU_MUSIC3_GLU", "1") == "0":
++        return False, "disabled by OMNIXPU_MUSIC3_GLU=0"
++    try:
++        import comfy.ldm.minimax_music.dit as m3
++        import comfy.model_management
++        from comfy_kitchen.tensor import QuantizedTensor, TensorWiseINT8Layout
++        from omni_xpu_kernel import int8 as oint8
++    except ImportError as e:
++        return False, f"import failed: {e}"
++    native = oint8._get_native()
++    fn = getattr(native, "quantize_int8_convrot_silu_mul_split", None)
++    if fn is None or "gate_second" not in (fn.__doc__ or ""):
++        return False, "omni_xpu_kernel has no gate_second (needs the phase-9 build)"
++    if not hasattr(oint8, "int8_linear_prequantized"):
++        return False, "omni_xpu_kernel has no int8_linear_prequantized"
++    split = int(os.environ.get("OMNIXPU_MUSIC3_GLU_SPLIT", "16"))
++
++    _orig_forward = m3.FeedForward.forward
++    stats = {"fused": 0, "fallback": 0, "error": 0}
++
++    def _plain(lin, x):
++        w = getattr(lin, "weight", None)
++        if not (
++            isinstance(w, QuantizedTensor)
++            and w._layout_cls == "TensorWiseINT8Layout"
++            and getattr(w._params, "convrot", False)
++            and not getattr(w._params, "transposed", False)
++            and int(getattr(w._params, "convrot_groupsize", 256)) == 256
++            and w.device == x.device
++            and not getattr(lin, "weight_function", None)
++            and not getattr(lin, "bias_function", None)
++            and not getattr(lin, "_full_precision_mm", False)
++            and not getattr(lin, "comfy_force_forward", False)
++        ):
++            return None
++        q, s = TensorWiseINT8Layout.get_plain_tensors(w)
++        if q.dim() != 2 or not q.is_contiguous() or q.shape[1] % 256 != 0:
++            return None
++        return q, s
++
++    def forward(self, x):
++        if not (
++            not comfy.model_management.in_training
++            and x.device.type == "xpu"
++            and x.dtype in (torch.float16, torch.bfloat16)
++            and len(self.ff) == 3
++        ):
++            stats["fallback"] += 1
++            return _orig_forward(self, x)
++        lin = self.ff[2]
++        plain = _plain(lin, x)
++        if plain is None:
++            stats["fallback"] += 1
++            return _orig_forward(self, x)
++        p = self.ff[0].proj(x)
++        try:
++            if p.shape[-1] != 2 * plain[0].shape[1] or p.dtype != x.dtype:
++                raise ValueError("unexpected GLU width or dtype")
++            bias = getattr(lin, "bias", None)
++            if bias is not None:
++                bias = comfy.model_management.cast_to(bias, dtype=p.dtype, device=p.device)
++            x_int8, x_scale = fn(p.reshape(-1, p.shape[-1]), 256, split, 1)
++            out = oint8.int8_linear_prequantized(x_int8, x_scale, plain[0], plain[1], bias, p.dtype)
++            stats["fused"] += 1
++            return out.reshape(*p.shape[:-1], out.shape[-1])
++        except Exception as e:  # noqa: BLE001
++            if stats["error"] == 0:
++                log.warning("[OmniXPU] Music 3 fused GLU failed, using stock: %s", e)
++            stats["error"] += 1
++            value, gate = p.chunk(2, dim=-1)
++            return lin(self.ff[1](value * torch.nn.functional.silu(gate)))
++
++    m3.FeedForward.forward = forward
++    forward.stats = stats
++    _applied = True
++    log.info("[OmniXPU] Music 3 GLU fused into the INT8 down-projection (row_split=%d)", split)
++    return True, None
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/fixes/music3_rope_dense.py b/ComfyUI-OmniXPU/fixes/music3_rope_dense.py
+--- a/ComfyUI-OmniXPU/fixes/music3_rope_dense.py	1970-01-01 00:00:00.000000000 +0000
++++ b/ComfyUI-OmniXPU/fixes/music3_rope_dense.py	2026-10-09 08:41:35.986092602 +0000
+@@ -0,0 +1,69 @@
++"""MiniMax Music 3: partial RoPE without strided kernels or concatenations (2026-10-09).
++
++Stock Attention.forward rotates only the first `rotary_dims` of each 64-wide head, feeding the
++kernel last-dim slices of transposed views of the qkv buffer, then rebuilds q and k with two
++torch.cat. On XPU every one of those is a strided pass: at batch 58 x 690 tokens the step costs
++8.0 ms of a 46 ms layer (rope on strided slices 4.1 ms, the two cats 3.8 ms) where the rotation
++itself is 0.95 ms on dense input.
++Here q and k get one dense copy each, the rotary half is rotated from a dense slice and written
++back through a (..., 2, 32) view. Same kernel, same values: bitwise equal to the stock result.
++Measured 8.0 -> 4.9 ms for the step, 12.4 -> 9.1 ms including the attention that follows.
++
++Applies when not training, on XPU, and rotary_dims is exactly half the head width (the only
++configuration the model ships with); anything else takes the stock forward.
++OMNIXPU_MUSIC3_ROPE=0 disables. Deployed as ComfyUI-OmniXPU/fixes/music3_rope_dense.py.
++"""
++import logging
++import os
++
++log = logging.getLogger("ComfyUI-OmniXPU")
++_applied = False
++
++
++def apply():
++    global _applied
++    if _applied:
++        return True, "already applied"
++    if os.environ.get("OMNIXPU_MUSIC3_ROPE", "1") == "0":
++        return False, "disabled by OMNIXPU_MUSIC3_ROPE=0"
++    try:
++        import comfy.ldm.minimax_music.dit as m3
++        import comfy.model_management
++        import comfy.quant_ops
++    except ImportError as e:
++        return False, f"import failed: {e}"
++    for name in ("AttentionTensorContainer", "optimized_attention_for_device"):
++        if not hasattr(m3, name):
++            return False, f"minimax_music.dit has no {name}"
++
++    _orig_forward = m3.Attention.forward
++    stats = {"dense": 0, "fallback": 0}
++
++    def forward(self, x, rotation_matrix):
++        batch, length, _ = x.shape
++        heads, dim = self.num_heads, self.dim_heads
++        rotary_dims = rotation_matrix.shape[-3] * 2
++        if comfy.model_management.in_training or x.device.type != "xpu" or rotary_dims * 2 != dim:
++            stats["fallback"] += 1
++            return _orig_forward(self, x, rotation_matrix)
++        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
++        q = q.reshape(batch, length, heads, dim).transpose(1, 2).contiguous().view(batch, heads, length, 2, rotary_dims)
++        k = k.reshape(batch, length, heads, dim).transpose(1, 2).contiguous().view(batch, heads, length, 2, rotary_dims)
++        v = v.reshape(batch, length, heads, dim).transpose(1, 2)
++        rotated_q, rotated_k = comfy.quant_ops.ck.apply_rope_split_half(
++            q[..., 0, :].contiguous(), k[..., 0, :].contiguous(), rotation_matrix)
++        q[..., 0, :] = rotated_q
++        k[..., 0, :] = rotated_k
++        del rotated_q, rotated_k
++        q, k = q.view(batch, heads, length, dim), k.view(batch, heads, length, dim)
++        attention = m3.optimized_attention_for_device(q.device)
++        q, k, v = m3.AttentionTensorContainer(q), m3.AttentionTensorContainer(k), m3.AttentionTensorContainer(v)
++        out = attention(q, k, v, heads, skip_reshape=True, preferred_attention=self.comfy_attention)
++        stats["dense"] += 1
++        return self.to_out(out)
++
++    m3.Attention.forward = forward
++    forward.stats = stats
++    _applied = True
++    log.info("[OmniXPU] Music 3 partial RoPE on dense q/k enabled")
++    return True, None
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/fixes/music3_window_batch.py b/ComfyUI-OmniXPU/fixes/music3_window_batch.py
+--- a/ComfyUI-OmniXPU/fixes/music3_window_batch.py	1970-01-01 00:00:00.000000000 +0000
++++ b/ComfyUI-OmniXPU/fixes/music3_window_batch.py	2026-10-09 06:42:54.147199311 +0000
+@@ -0,0 +1,88 @@
++"""MiniMax Music 3: run the overlapping condition windows as one batch (2026-10-09).
++
++Stock MiniMaxMusic3DiT.forward walks a long latent in overlapping windows and calls the
++36-layer transformer once per window. A 120 s song is 30 windows per step, each a batch of 2
++(cond + uncond) over a few hundred tokens of width 2048: 1080 layer calls per step at about
++2.4 ms each, where the arithmetic alone is worth roughly 0.7 s of the 2.6 s step. On XPU the
++rest is per-call launch overhead on small matrices. Windows of equal length are independent,
++so they are stacked on the batch axis and sent through the transformer together; shorter
++tail windows go through one at a time exactly as before. Same math, different batch size.
++
++OMNIXPU_MUSIC3_BATCH=0 disables; OMNIXPU_MUSIC3_BATCH_MAX caps windows per call (default 32).
++Deployed as ComfyUI-OmniXPU/fixes/music3_window_batch.py.
++"""
++import logging
++import os
++
++import torch
++
++log = logging.getLogger("ComfyUI-OmniXPU")
++_applied = False
++
++
++def apply():
++    global _applied
++    if _applied:
++        return True, "already applied"
++    if os.environ.get("OMNIXPU_MUSIC3_BATCH", "1") == "0":
++        return False, "disabled by OMNIXPU_MUSIC3_BATCH=0"
++    try:
++        import comfy.ldm.minimax_music.dit as m3
++    except ImportError as e:
++        return False, f"import failed: {e}"
++    for name in ("latent_length", "MAX_CONDITION_FRAMES", "CONDITION_HOP_FRAMES"):
++        if not hasattr(m3, name):
++            return False, f"minimax_music.dit has no {name}"
++    max_windows = max(1, int(os.environ.get("OMNIXPU_MUSIC3_BATCH_MAX", "32")))
++    _orig_forward = m3.MiniMaxMusic3DiT.forward
++    stats = {"batched": 0, "fallback": 0}
++
++    def forward(self, x, timestep, context, conditioning_scale, **kwargs):
++        window = m3.latent_length(m3.MAX_CONDITION_FRAMES)
++        if x.device.type != "xpu" or x.shape[-1] <= window or timestep.shape[0] != x.shape[0]:
++            stats["fallback"] += 1
++            return _orig_forward(self, x, timestep, context, conditioning_scale, **kwargs)
++
++        condition = self.aligned_condition(context)
++        condition = condition * conditioning_scale[:, :1, :1]
++        if condition.shape[-1] < x.shape[-1]:
++            condition = torch.nn.functional.pad(condition, (0, x.shape[-1] - condition.shape[-1]))
++        else:
++            condition = condition[..., :x.shape[-1]]
++
++        hop = m3.latent_length(m3.CONDITION_HOP_FRAMES)
++        total, b = x.shape[-1], x.shape[0]
++        spans, start = [], 0
++        while start < total:
++            end = min(start + window, total)
++            spans.append((start, end))
++            if end == total:
++                break
++            start += hop
++        full = [s for s in spans if s[1] - s[0] == window]
++        tail = [s for s in spans if s[1] - s[0] != window]
++
++        output = torch.zeros_like(x)
++        count = torch.zeros((1, 1, total), device=x.device, dtype=x.dtype)
++        for i in range(0, len(full), max_windows):
++            group = full[i:i + max_windows]
++            out = self.diffusion_transformer(
++                torch.cat([x[..., s:e] for s, e in group], dim=0),
++                timestep.repeat(len(group)),
++                torch.cat([condition[..., s:e] for s, e in group], dim=0),
++            )
++            for j, (s, e) in enumerate(group):
++                output[..., s:e] -= out[j * b:(j + 1) * b]
++                count[..., s:e] += 1
++            del out
++        for s, e in tail:
++            output[..., s:e] -= self.diffusion_transformer(x[..., s:e], timestep, condition[..., s:e])
++            count[..., s:e] += 1
++        stats["batched"] += 1
++        return output / count
++
++    m3.MiniMaxMusic3DiT.forward = forward
++    forward.stats = stats
++    _applied = True
++    log.info("[OmniXPU] Music 3 condition windows batched (max %d per call)", max_windows)
++    return True, None
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/fixes/xpu_int8_compute.py b/ComfyUI-OmniXPU/fixes/xpu_int8_compute.py
+--- a/ComfyUI-OmniXPU/fixes/xpu_int8_compute.py	1970-01-01 00:00:00.000000000 +0000
++++ b/ComfyUI-OmniXPU/fixes/xpu_int8_compute.py	2026-10-09 05:45:39.545455965 +0000
+@@ -0,0 +1,48 @@
++"""Tell ComfyUI that INT8 quantized matmul is native on XPU (2026-10-09).
++
++ComfyUI 0.39 added model_management.supports_int8_compute(); it returns False for Intel XPU
++because stock comfy_kitchen has no XPU backend and torch._int_mm is not implemented there.
++With False, pick_operations() lists int8_tensorwise / convrot_w4a4 as "emulated" and every
++INT8 Linear sets _full_precision_mm: weights are dequantized to bf16 per call and the GEMM
++runs in float. On H3 that is 6.2 -> 7.3 s/step (480x864, 124 frames) and it bypasses the
++whole omni_xpu_kernel INT8 path. With the grafted XPU backend registered the INT8 ops are
++native, so answer True for XPU devices. OMNIXPU_INT8_COMPUTE=0 disables.
++Deployed as ComfyUI-OmniXPU/fixes/xpu_int8_compute.py; must run before any model is loaded.
++"""
++import logging
++import os
++
++log = logging.getLogger("ComfyUI-OmniXPU")
++_applied = False
++
++
++def apply():
++    global _applied
++    if _applied:
++        return True, "already applied"
++    if os.environ.get("OMNIXPU_INT8_COMPUTE", "1") == "0":
++        return False, "disabled by OMNIXPU_INT8_COMPUTE=0"
++    try:
++        import comfy.model_management as mm
++        import comfy_kitchen as ck
++    except ImportError as e:
++        return False, f"import failed: {e}"
++    if not hasattr(mm, "supports_int8_compute"):
++        return False, "this ComfyUI has no supports_int8_compute (nothing to fix)"
++    caps = ck.registry._capabilities.get("xpu", set())
++    if not ck.registry.is_available("xpu") or "int8_linear" not in caps:
++        return False, "comfy_kitchen xpu backend has no int8_linear"
++
++    _orig = mm.supports_int8_compute
++
++    def supports_int8_compute(device=None):
++        if device is None:
++            device = mm.get_torch_device()
++        if getattr(device, "type", None) == "xpu":
++            return True
++        return _orig(device)
++
++    mm.supports_int8_compute = supports_int8_compute
++    _applied = True
++    log.info("[OmniXPU] INT8 quantized matmul reported as native on XPU")
++    return True, None
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/ComfyUI-OmniXPU/fixes/xpu_pinned_memory.py b/ComfyUI-OmniXPU/fixes/xpu_pinned_memory.py
+--- a/ComfyUI-OmniXPU/fixes/xpu_pinned_memory.py	1970-01-01 00:00:00.000000000 +0000
++++ b/ComfyUI-OmniXPU/fixes/xpu_pinned_memory.py	2026-10-09 06:30:38.355447986 +0000
+@@ -0,0 +1,159 @@
++"""XPU pinned host memory for ComfyUI model offload (found 2026-09-05 on Arc Pro B70).
++
++ComfyUI enables pinned memory only for CUDA/ROCm (``is_nvidia() or is_amd()`` in
++comfy/model_management.py) and pins with ``cudaHostRegister``. On XPU ``MAX_PINNED_MEMORY``
++stays -1, so every weight move between host and device is a pageable copy. Measured on
++B70 in an LXC: 1.9 GB/s H2D and 2.1 GB/s D2H pageable vs 26.8 / 9.6 GB/s pinned. A new
++prompt swaps the 26 GB text encoder in and out and reloads the 20 GB DiT: ~28 s, of which
++~18 s is copy time.
++
++This module
++  (a) enables MAX_PINNED_MEMORY with ComfyUI's own formula,
++  (b) replaces pin_memory / unpin_memory with a storage-swap implementation (there is no
++      host-register API in torch-xpu; the tensor's storage is replaced by a pinned copy),
++  (c) wraps ModelPatcher.unpatch_model so a full offload lands in pinned host memory
++      (``nn.Module.to("cpu")`` would allocate fresh pageable tensors).
++
++OMNIXPU_PIN_MEMORY=0 disables it. Deployed as ComfyUI-OmniXPU/fixes/xpu_pinned_memory.py.
++"""
++import logging
++import os
++
++import torch
++
++log = logging.getLogger("ComfyUI-OmniXPU")
++
++_applied = False
++
++
++def _inner(tensor):
++    """The plain tensor whose storage is the payload (QuantizedTensor keeps it in _qdata)."""
++    q = getattr(tensor, "_qdata", None)
++    return q if isinstance(q, torch.Tensor) else tensor
++
++
++def _pinned_copy(t):
++    out = torch.empty_like(t, device="cpu", pin_memory=True)
++    out.copy_(t, non_blocking=True)
++    return out
++
++
++def _to_pinned_cpu(t):
++    """Pinned-CPU copy of a device tensor; QuantizedTensor keeps its layout/params."""
++    q = getattr(t, "_qdata", None)
++    if isinstance(q, torch.Tensor) and hasattr(t, "_copy_with"):
++        return t._copy_with(qdata=_pinned_copy(q), params=t._params.to_device("cpu"), clone_params=False)
++    return _pinned_copy(t)
++
++
++def apply():
++    global _applied
++    if _applied:
++        return True, "already applied"
++    if os.environ.get("OMNIXPU_PIN_MEMORY", "1") == "0":
++        return False, "disabled by OMNIXPU_PIN_MEMORY=0"
++    import comfy.model_management as mm
++    import comfy.model_patcher as mp
++    import comfy.utils
++    from comfy.cli_args import args
++
++    if args.disable_pinned_memory:
++        return False, "--disable-pinned-memory"
++    if mm.MAX_PINNED_MEMORY > 0:
++        return False, "ComfyUI already enabled pinned memory"
++    try:
++        probe = torch.empty(1, pin_memory=True)
++        if not probe.is_pinned():
++            return False, "torch cannot allocate pinned memory here"
++    except Exception as e:  # noqa: BLE001
++        return False, f"pinned allocation failed: {e}"
++
++    ram = mm.get_total_memory(torch.device("cpu"))
++    swap = 0 if comfy.system_memory.cgroup_memory_limit() is not None else mm.get_disk_swap_total()
++    mm.MAX_PINNED_MEMORY = max(ram * 0.40, min(ram * 0.90, ram - 4 * 1024 ** 3, ram + swap - 16 * 1024 ** 3))
++
++    def pin_memory(tensor, evict_active=True):
++        if mm.MAX_PINNED_MEMORY <= 0:
++            return False
++        if type(tensor).__name__ not in mm.PINNING_ALLOWED_TYPES:
++            return False
++        if not mm.is_device_cpu(tensor.device):
++            return False
++        inner = _inner(tensor)
++        if not inner.is_contiguous():
++            return False
++        size = inner.nbytes
++        if inner.is_pinned():
++            # already pinned by an earlier swap or by our unpatch wrapper: keep the books
++            if inner.data_ptr() not in mm.PINNED_MEMORY:
++                mm.PINNED_MEMORY[inner.data_ptr()] = size
++                mm.TOTAL_PINNED_MEMORY += size
++                return True
++            return False
++        comfy.memory_management.extra_ram_release(comfy.memory_management.RAM_CACHE_HEADROOM)
++        try:
++            ok = mm.ensure_pin_registerable(size, evict_active=evict_active)
++        except TypeError:  # ComfyUI < 0.39
++            ok = mm.ensure_pin_registerable(size)
++        if ok is False:
++            return False
++        try:
++            pinned = inner.pin_memory()
++            inner.set_(pinned.untyped_storage(), pinned.storage_offset(), pinned.size(), pinned.stride())
++        except Exception as e:  # noqa: BLE001
++            log.warning("[OmniXPU] XPU pin failed (%s), leaving tensor pageable", e)
++            return False
++        mm.PINNED_MEMORY[inner.data_ptr()] = size
++        mm.TOTAL_PINNED_MEMORY += size
++        return True
++
++    def unpin_memory(tensor):
++        # The pinned storage is released with the tensor; only the accounting is undone.
++        if mm.MAX_PINNED_MEMORY <= 0:
++            return False
++        if not mm.is_device_cpu(tensor.device):
++            return False
++        size = mm.PINNED_MEMORY.pop(_inner(tensor).data_ptr(), None)
++        if size is None:
++            return False
++        mm.TOTAL_PINNED_MEMORY -= size
++        return True
++
++    mm.pin_memory = pin_memory
++    mm.unpin_memory = unpin_memory
++
++    _orig_unpatch_model = mp.ModelPatcher.unpatch_model
++
++    def _offload_to_pinned(model):
++        """Copy every XPU parameter/buffer into pinned host memory before Module.to(cpu)."""
++        moved = []
++        for name, p in list(model.named_parameters()):
++            if p.device.type == "xpu":
++                moved.append((name, True, _to_pinned_cpu(p)))
++        for name, b in list(model.named_buffers()):
++            if b.device.type == "xpu":
++                moved.append((name, False, _to_pinned_cpu(b)))
++        if not moved:
++            return 0
++        torch.xpu.synchronize()  # non_blocking D2H copies must land before the sources die
++        for name, is_param, t in moved:
++            if is_param:
++                comfy.utils.set_attr_param(model, name, t)
++            else:
++                comfy.utils.set_attr(model, name, t)
++        return len(moved)
++
++    def unpatch_model(self, device_to=None, unpatch_weights=True):
++        if unpatch_weights and device_to is not None and mm.is_device_cpu(device_to):
++            try:
++                n = _offload_to_pinned(self.model)
++                if n:
++                    log.debug("[OmniXPU] offloaded %d tensors of %s into pinned host memory", n, type(self.model).__name__)
++            except Exception as e:  # noqa: BLE001
++                log.warning("[OmniXPU] pinned offload failed, falling back to Module.to(cpu): %s", e)
++        return _orig_unpatch_model(self, device_to=device_to, unpatch_weights=unpatch_weights)
++
++    mp.ModelPatcher.unpatch_model = unpatch_model
++    _applied = True
++    log.info("[OmniXPU] XPU pinned host memory enabled (limit %d MB)", mm.MAX_PINNED_MEMORY // (1024 * 1024))
++    return True, None

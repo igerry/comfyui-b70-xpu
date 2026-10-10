@@ -1,0 +1,7 @@
+--- backends/eager/adaln.py	2026-09-05 00:41:12.445781289 +0000
++++ backends/eager/adaln.py	2026-09-05 00:14:24.393312437 +0000
+@@ -57,4 +57,3 @@
+ @_op_rms_adaln.register_fake
+ def _op_rms_adaln_fake(x, scale, shift, eps):
+     return torch.empty_like(x)
+-

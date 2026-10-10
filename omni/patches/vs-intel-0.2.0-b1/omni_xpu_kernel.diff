@@ -1,0 +1,1798 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/_version.py b/omni_xpu_kernel/omni_xpu_kernel/_version.py
+--- a/omni_xpu_kernel/omni_xpu_kernel/_version.py	2026-08-10 07:44:55.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/_version.py	2026-10-09 09:35:32.522878158 +0000
+@@ -14,7 +14,7 @@
+ # they were compiled against.
+ __image_version__ = "0.2.0-b1"
+ __base_version__ = "0.2.0b1"
+-__supported_torch_minors__ = ("2.10", "2.11", "2.12")
++__supported_torch_minors__ = ("2.10", "2.11", "2.12", "2.13", "2.14")
+ __supported_xpu_targets__ = ("bmg", "ptl-h")
+ 
+ 
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/csrc/bindings.cpp b/omni_xpu_kernel/omni_xpu_kernel/csrc/bindings.cpp
+--- a/omni_xpu_kernel/omni_xpu_kernel/csrc/bindings.cpp	2026-08-07 00:52:57.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/csrc/bindings.cpp	2026-10-09 09:35:32.522280533 +0000
+@@ -30,6 +30,8 @@
+ }
+ namespace norm {
+     torch::Tensor rms_norm(torch::Tensor weight, torch::Tensor input, double eps);
++    torch::Tensor rms_norm_mod(torch::Tensor weight, torch::Tensor input, torch::Tensor scale,
++        torch::Tensor shift, torch::Tensor seg_end, torch::Tensor seg_mod, double eps);
+ #if defined(OMNI_XPU_ARCH_BMG)
+     torch::Tensor group_norm_bmg(
+         torch::Tensor input, int64_t groups, torch::Tensor weight,
+@@ -105,6 +107,10 @@
+         torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
+         torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
+         int64_t out_dtype_code);
++    torch::Tensor int8_linear_prequantized_postop(
++        torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
++        torch::Tensor weight_scale, int64_t out_dtype_code, int64_t postop,
++        std::optional<torch::Tensor> binary);
+     torch::Tensor int8_linear_prequantized_out(
+         torch::Tensor x_int8, torch::Tensor x_scale, torch::Tensor weight,
+         torch::Tensor weight_scale, std::optional<torch::Tensor> bias,
+@@ -144,6 +150,16 @@
+         torch::Tensor weight, int64_t group_size, int64_t stochastic_rounding);
+     torch::Tensor dequantize_int8_convrot_weight(
+         torch::Tensor q, torch::Tensor scale, int64_t group_size);
++    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused(
++        torch::Tensor input, int64_t group_size);
++    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused_split(
++        torch::Tensor input, int64_t group_size, int64_t row_split);
++    std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_silu_mul_split(
++        torch::Tensor fc1_out, int64_t group_size, int64_t row_split, int64_t gate_second);
++    std::tuple<torch::Tensor, torch::Tensor> rms_norm_mod_convrot_quant(
++        torch::Tensor x, std::optional<torch::Tensor> other, std::optional<torch::Tensor> gate,
++        torch::Tensor weight, torch::Tensor scale, torch::Tensor shift, torch::Tensor seg_end,
++        torch::Tensor seg_mod, double eps, int64_t group_size, int64_t row_split);
+     torch::Tensor fused_scaleback(torch::Tensor gemm_result, torch::Tensor x_scale,
+                                   torch::Tensor w_scale, std::optional<torch::Tensor> bias,
+                                   int64_t out_dtype_code);
+@@ -313,6 +329,11 @@
+     norm.def("rms_norm", &omni_xpu::norm::rms_norm,
+         "RMSNorm using ESIMD optimization",
+         py::arg("weight"), py::arg("input"), py::arg("eps") = 1e-6);
++    norm.def("rms_norm_mod", &omni_xpu::norm::rms_norm_mod,
++        "RMSNorm with fused AdaLN modulation: norm(x)*w*(1+scale[mod])+shift[mod], mod per row via <=8 segments\n"
++        "(seg_end int32[8] cumulative row ends, seg_mod int32[8] modulation row index).",
++        py::arg("weight"), py::arg("input"), py::arg("scale"), py::arg("shift"), py::arg("seg_end"),
++        py::arg("seg_mod"), py::arg("eps") = 1e-6);
+ 
+ #if defined(OMNI_XPU_ARCH_BMG)
+     norm.attr("__group_norm_bmg__") = true;
+@@ -538,6 +559,11 @@
+         py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"),
+         py::arg("weight_scale"), py::arg("bias") = py::none(),
+         py::arg("out_dtype_code") = 2);
++    int8.def("int8_linear_prequantized_postop", &omni_xpu::int8_ops::int8_linear_prequantized_postop,
++        "Scaled INT8 matmul with a fused oneDNN post-op: postop=1 swish (SiLU) on the dequantized\n"
++        "accumulator, postop=2 elementwise multiply by `binary` ([M,N], output dtype).",
++        py::arg("x_int8"), py::arg("x_scale"), py::arg("weight"), py::arg("weight_scale"),
++        py::arg("out_dtype_code") = 2, py::arg("postop") = 1, py::arg("binary") = py::none());
+     int8.def(
+         "int8_linear_prequantized_out",
+         &omni_xpu::int8_ops::int8_linear_prequantized_out,
+@@ -628,6 +654,22 @@
+     int8.def("dequantize_int8_convrot_weight", &omni_xpu::int8_ops::dequantize_int8_convrot_weight,
+         "Dequantize INT8 ConvRot weight and apply the inverse orthogonal rotation",
+         py::arg("q"), py::arg("scale"), py::arg("group_size") = 256);
++    int8.def("quantize_int8_convrot_fused", &omni_xpu::int8_ops::quantize_int8_convrot_fused,
++        "Fused radix-4 Hadamard rotation (in registers) + rowwise INT8 quantization for a 2D\n"
++        "bf16/fp16 activation. Replaces rotate_convrot (matmul) + quantize_int8_rowwise.",
++        py::arg("input"), py::arg("group_size") = 256);
++    int8.def("quantize_int8_convrot_fused_split", &omni_xpu::int8_ops::quantize_int8_convrot_fused_split,
++        "Row-split fused radix-4 Hadamard rotation + rowwise INT8 quantization (row_split work-items per row).",
++        py::arg("input"), py::arg("group_size") = 256, py::arg("row_split") = 8);
++    int8.def("quantize_int8_convrot_silu_mul_split", &omni_xpu::int8_ops::quantize_int8_convrot_silu_mul_split,
++        "SiLU(gate)*up on a [M, 2K] fc1 output fused with radix-4 Hadamard rotation and rowwise INT8 quantization.",
++        py::arg("fc1_out"), py::arg("group_size") = 256, py::arg("row_split") = 16, py::arg("gate_second") = 0);
++    int8.def("rms_norm_mod_convrot_quant", &omni_xpu::int8_ops::rms_norm_mod_convrot_quant,
++        "[x += gate[mod]*other] -> RMSNorm -> *(1+scale[mod])+shift[mod] -> Hadamard -> rowwise INT8, one pass.\n"
++        "Returns (int8 [M,H], scales [M,1]); x is updated in place when other is given.",
++        py::arg("x"), py::arg("other") = py::none(), py::arg("gate") = py::none(), py::arg("weight"),
++        py::arg("scale"), py::arg("shift"), py::arg("seg_end"), py::arg("seg_mod"), py::arg("eps") = 1e-6,
++        py::arg("group_size") = 256, py::arg("row_split") = 8);
+     int8.def("fused_scaleback", &omni_xpu::int8_ops::fused_scaleback,
+         "ESIMD fused scale-back: int32 GEMM result → output dtype in single pass.\n"
+         "Fuses: int32→f32 cast + scale multiply + dtype conversion + bias add.\n"
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/csrc/int8_convrot_quant_esimd.cpp b/omni_xpu_kernel/omni_xpu_kernel/csrc/int8_convrot_quant_esimd.cpp
+--- a/omni_xpu_kernel/omni_xpu_kernel/csrc/int8_convrot_quant_esimd.cpp	2026-07-23 09:11:55.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/csrc/int8_convrot_quant_esimd.cpp	2026-10-09 09:35:32.521908585 +0000
+@@ -1,5 +1,6 @@
+ #include <torch/extension.h>
+ #include <sycl/sycl.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+ #include <sycl/ext/intel/esimd.hpp>
+ 
+ #include <tuple>
+@@ -14,6 +15,13 @@
+ namespace int8_ops {
+ namespace {
+ 
++#ifndef OMNI_CONVROT_QUANT_GRF
++#if defined(OMNI_XPU_ARCH_BMG)
++#define OMNI_CONVROT_QUANT_GRF 256
++#else
++#define OMNI_CONVROT_QUANT_GRF 128
++#endif
++#endif
+ #ifndef OMNI_CONVROT_QUANT_WG_SIZE
+ #if defined(OMNI_XPU_ARCH_PTL_H)
+ #define OMNI_CONVROT_QUANT_WG_SIZE 1
+@@ -62,6 +70,24 @@
+ }
+ 
+ template<typename InputT, int GroupSize>
++SYCL_ESIMD_FUNCTION inline void quantize_store_group(
++    const InputT* __restrict__ input,
++    int8_t* __restrict__ output,
++    int64_t offset,
++    float inv_scale) {
++    simd<float, GroupSize> values =
++        load_rotated<InputT, GroupSize>(input + offset);
++    simd<float, GroupSize> quantized =
++        sycl::ext::intel::esimd::rnde<float, GroupSize>(values * inv_scale);
++    quantized = sycl::ext::intel::esimd::max<float, GroupSize>(
++        sycl::ext::intel::esimd::min<float, GroupSize>(
++            quantized, simd<float, GroupSize>(127.0f)),
++        simd<float, GroupSize>(-128.0f));
++    simd<int8_t, GroupSize> packed = quantized;
++    block_store<int8_t, GroupSize>(output + offset, packed);
++}
++
++template<typename InputT, int GroupSize>
+ void quantize_convrot_kernel(
+     const InputT* __restrict__ input,
+     int8_t* __restrict__ output,
+@@ -73,16 +99,36 @@
+     const int64_t padded =
+         (rows + WorkGroupSize - 1) / WorkGroupSize * WorkGroupSize;
+     auto cgf = [&](sycl::handler& handle) {
++        sycl::ext::oneapi::experimental::properties props{
++            sycl::ext::intel::experimental::grf_size<OMNI_CONVROT_QUANT_GRF>};
+         handle.parallel_for(
+             sycl::nd_range<1>(
+                 sycl::range<1>(padded), sycl::range<1>(WorkGroupSize)),
++            props,
+             [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+                 const int64_t row = item.get_global_id(0);
+                 if (row >= rows) return;
+                 const int64_t row_start = row * groups * GroupSize;
+ 
++                // Two independent load->Hadamard chains per iteration so the
++                // second 512-byte load is issued before the first chain's math.
+                 float row_max = 0.0f;
+-                for (int64_t group = 0; group < groups; ++group) {
++                int64_t group = 0;
++                for (; group + 1 < groups; group += 2) {
++                    simd<float, GroupSize> values0 =
++                        load_rotated<InputT, GroupSize>(
++                            input + row_start + group * GroupSize);
++                    simd<float, GroupSize> values1 =
++                        load_rotated<InputT, GroupSize>(
++                            input + row_start + (group + 1) * GroupSize);
++                    simd<float, GroupSize> magnitudes =
++                        sycl::ext::intel::esimd::max<float, GroupSize>(
++                            sycl::ext::intel::esimd::abs<float, GroupSize>(values0),
++                            sycl::ext::intel::esimd::abs<float, GroupSize>(values1));
++                    const float group_max = hmax<float>(magnitudes);
++                    row_max = group_max > row_max ? group_max : row_max;
++                }
++                for (; group < groups; ++group) {
+                     simd<float, GroupSize> values =
+                         load_rotated<InputT, GroupSize>(
+                             input + row_start + group * GroupSize);
+@@ -97,21 +143,17 @@
+                 const float inv_scale = 1.0f / scale;
+                 scales[row] = scale;
+ 
+-                simd<float, GroupSize> clamp_lo(-128.0f);
+-                simd<float, GroupSize> clamp_hi(127.0f);
+-                for (int64_t group = 0; group < groups; ++group) {
+-                    const int64_t offset = row_start + group * GroupSize;
+-                    simd<float, GroupSize> values =
+-                        load_rotated<InputT, GroupSize>(input + offset);
+-                    simd<float, GroupSize> quantized =
+-                        sycl::ext::intel::esimd::rnde<float, GroupSize>(
+-                            values * inv_scale);
+-                    quantized = sycl::ext::intel::esimd::max<float, GroupSize>(
+-                        sycl::ext::intel::esimd::min<float, GroupSize>(
+-                            quantized, clamp_hi),
+-                        clamp_lo);
+-                    simd<int8_t, GroupSize> packed = quantized;
+-                    block_store<int8_t, GroupSize>(output + offset, packed);
++                group = 0;
++                for (; group + 1 < groups; group += 2) {
++                    quantize_store_group<InputT, GroupSize>(
++                        input, output, row_start + group * GroupSize, inv_scale);
++                    quantize_store_group<InputT, GroupSize>(
++                        input, output, row_start + (group + 1) * GroupSize,
++                        inv_scale);
++                }
++                for (; group < groups; ++group) {
++                    quantize_store_group<InputT, GroupSize>(
++                        input, output, row_start + group * GroupSize, inv_scale);
+                 }
+             });
+     };
+@@ -139,6 +181,570 @@
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Row-split variant (2026-09-06): WG work-items share one row. Each handles a
++// contiguous range of GroupSize-wide groups; the row max is reduced via SLM.
++// Butterflies are 64-wide vector ops (2-D views); rotated values are cached in
++// GRF between the two passes when a work-item owns <= kCache groups.
++template<int Stride, int GroupSize>
++inline void radix4_stage_vec(simd<float, GroupSize>& values) {
++    constexpr int Rows = GroupSize / (4 * Stride);
++    constexpr int Q = GroupSize / 4;
++    auto m = values.template bit_cast_view<float, Rows, 4 * Stride>();
++    simd<float, Q> a = m.template select<Rows, 1, Stride, 1>(0, 0);
++    simd<float, Q> b = m.template select<Rows, 1, Stride, 1>(0, Stride);
++    simd<float, Q> c = m.template select<Rows, 1, Stride, 1>(0, 2 * Stride);
++    simd<float, Q> d = m.template select<Rows, 1, Stride, 1>(0, 3 * Stride);
++    m.template select<Rows, 1, Stride, 1>(0, 0) = a + b + c - d;
++    m.template select<Rows, 1, Stride, 1>(0, Stride) = a + b - c + d;
++    m.template select<Rows, 1, Stride, 1>(0, 2 * Stride) = a - b + c + d;
++    m.template select<Rows, 1, Stride, 1>(0, 3 * Stride) = -a + b + c + d;
++    if constexpr (Stride * 4 < GroupSize) {
++        radix4_stage_vec<Stride * 4, GroupSize>(values);
++    }
++}
++
++// Rotated group rounded to the input dtype (the composed path's materialization boundary).
++template<typename InputT, int GroupSize>
++inline simd<InputT, GroupSize> load_rotated_rounded_vec(
++    const InputT* __restrict__ input) {
++    simd<InputT, GroupSize> source = block_load<InputT, GroupSize>(input);
++    simd<float, GroupSize> values = source;
++    radix4_stage_vec<1, GroupSize>(values);
++    values *= 1.0f / sycl::sqrt(static_cast<float>(GroupSize));
++    simd<InputT, GroupSize> rounded = values;
++    return rounded;
++}
++
++template<typename InputT, int GroupSize>
++SYCL_ESIMD_FUNCTION inline void quantize_store_rounded(
++    simd<InputT, GroupSize> rounded,
++    int8_t* __restrict__ output,
++    int64_t offset,
++    float inv_scale) {
++    simd<float, GroupSize> values = rounded;
++    simd<float, GroupSize> quantized =
++        sycl::ext::intel::esimd::rnde<float, GroupSize>(values * inv_scale);
++    quantized = sycl::ext::intel::esimd::max<float, GroupSize>(
++        sycl::ext::intel::esimd::min<float, GroupSize>(
++            quantized, simd<float, GroupSize>(127.0f)),
++        simd<float, GroupSize>(-128.0f));
++    simd<int8_t, GroupSize> packed = quantized;
++    block_store<int8_t, GroupSize>(output + offset, packed);
++}
++
++template<typename InputT, int GroupSize, int WG>
++void quantize_convrot_rowsplit_kernel(
++    const InputT* __restrict__ input,
++    int8_t* __restrict__ output,
++    float* __restrict__ scales,
++    int64_t rows,
++    int64_t groups,
++    const at::Device& device) {
++    constexpr int kCache = 4;  // groups kept in GRF per work-item (4 x 512 B bf16)
++    const int gpw = static_cast<int>((groups + WG - 1) / WG);
++    const bool use_cache = gpw <= kCache;
++    sycl::range<2> global_size(static_cast<size_t>(rows), WG);
++    sycl::range<2> local_size(1, WG);
++    auto cgf = [&](sycl::handler& handle) {
++        sycl::ext::oneapi::experimental::properties props{
++            sycl::ext::intel::experimental::grf_size<OMNI_CONVROT_QUANT_GRF>};
++        handle.parallel_for(
++            sycl::nd_range<2>(global_size, local_size),
++            props,
++            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
++                constexpr int kSlmBytes = (WG * 4 < 16) ? 16 : WG * 4;
++                slm_init<kSlmBytes>();
++                const int64_t row = item.get_global_id(0);
++                const int t = static_cast<int>(item.get_local_id(1));
++                const int64_t row_start = row * groups * GroupSize;
++                const int g0 = t * gpw;
++                const int g1 = static_cast<int>(
++                    (g0 + gpw < groups) ? (g0 + gpw) : groups);
++
++                simd<InputT, GroupSize> cache[kCache];
++                float local_max = 0.0f;
++                if (use_cache) {
++                    #pragma unroll
++                    for (int i = 0; i < kCache; ++i) {
++                        const int g = g0 + i;
++                        if (g < g1) {
++                            cache[i] = load_rotated_rounded_vec<InputT, GroupSize>(
++                                input + row_start + g * GroupSize);
++                            simd<float, GroupSize> values = cache[i];
++                            const float group_max = hmax<float>(
++                                sycl::ext::intel::esimd::abs<float, GroupSize>(values));
++                            local_max = group_max > local_max ? group_max : local_max;
++                        }
++                    }
++                } else {
++                    for (int g = g0; g < g1; ++g) {
++                        simd<float, GroupSize> values =
++                            load_rotated_rounded_vec<InputT, GroupSize>(
++                                input + row_start + g * GroupSize);
++                        const float group_max = hmax<float>(
++                            sycl::ext::intel::esimd::abs<float, GroupSize>(values));
++                        local_max = group_max > local_max ? group_max : local_max;
++                    }
++                }
++                slm_block_store<float, 1>(t * sizeof(float), local_max);
++                barrier();
++                simd<float, WG> partials = slm_block_load<float, WG>(0);
++                const float row_max = hmax<float>(partials);
++
++                float scale = row_max / 127.0f;
++                if (scale < 1e-30f) scale = 1e-30f;
++                const float inv_scale = 1.0f / scale;
++                if (t == 0) scales[row] = scale;
++
++                if (use_cache) {
++                    #pragma unroll
++                    for (int i = 0; i < kCache; ++i) {
++                        const int g = g0 + i;
++                        if (g < g1) {
++                            quantize_store_rounded<InputT, GroupSize>(
++                                cache[i], output, row_start + g * GroupSize, inv_scale);
++                        }
++                    }
++                } else {
++                    for (int g = g0; g < g1; ++g) {
++                        quantize_store_rounded<InputT, GroupSize>(
++                            load_rotated_rounded_vec<InputT, GroupSize>(
++                                input + row_start + g * GroupSize),
++                            output, row_start + g * GroupSize, inv_scale);
++                    }
++                }
++            });
++    };
++    utils::submit_kernel(cgf, device, "int8_convrot_quantize_rowsplit");
++}
++
++template<typename InputT, int GroupSize>
++void dispatch_rowsplit(
++    const InputT* input, int8_t* output, float* scales,
++    int64_t rows, int64_t groups, int row_split, const at::Device& device) {
++    switch (row_split) {
++        case 4:  quantize_convrot_rowsplit_kernel<InputT, GroupSize, 4>(input, output, scales, rows, groups, device); break;
++        case 16: quantize_convrot_rowsplit_kernel<InputT, GroupSize, 16>(input, output, scales, rows, groups, device); break;
++        case 32: quantize_convrot_rowsplit_kernel<InputT, GroupSize, 32>(input, output, scales, rows, groups, device); break;
++        default: quantize_convrot_rowsplit_kernel<InputT, GroupSize, 8>(input, output, scales, rows, groups, device); break;
++    }
++}
++
++// SiLU(gate)*up -> rotated -> rounded group (fc2 producer fusion, 2026-09-06).
++template<typename InputT, int GroupSize>
++inline simd<InputT, GroupSize> load_silu_mul_rotated_rounded_vec(
++    const InputT* __restrict__ gate,
++    const InputT* __restrict__ up) {
++    simd<InputT, GroupSize> gate_v = block_load<InputT, GroupSize>(gate);
++    simd<InputT, GroupSize> up_v = block_load<InputT, GroupSize>(up);
++    simd<float, GroupSize> x = gate_v;
++    simd<float, GroupSize> denominator = 1.0f + sycl::ext::intel::esimd::exp(-x);
++    simd<float, GroupSize> silu = x / denominator;
++    // Same refinement as h3_silu_mul.cpp: one Newton step on the divide for finite positive x.
++    simd<float, GroupSize> refined = silu + (x - silu * denominator) / denominator;
++    silu.merge(refined, x > 0.0f);
++    simd<InputT, GroupSize> silu_rounded = silu;
++    simd<float, GroupSize> silu_f = silu_rounded;
++    simd<float, GroupSize> up_f = up_v;
++    simd<InputT, GroupSize> product = silu_f * up_f;
++    simd<float, GroupSize> values = product;
++    radix4_stage_vec<1, GroupSize>(values);
++    values *= 1.0f / sycl::sqrt(static_cast<float>(GroupSize));
++    simd<InputT, GroupSize> rounded = values;
++    return rounded;
++}
++
++template<typename InputT, int GroupSize, int WG>
++void quantize_convrot_silu_mul_rowsplit_kernel(
++    const InputT* __restrict__ gate,
++    const InputT* __restrict__ up,
++    int64_t in_row_stride,
++    int8_t* __restrict__ output,
++    float* __restrict__ scales,
++    int64_t rows,
++    int64_t groups,
++    const at::Device& device) {
++    constexpr int kCache = 4;
++    const int gpw = static_cast<int>((groups + WG - 1) / WG);
++    const bool use_cache = gpw <= kCache;
++    sycl::range<2> global_size(static_cast<size_t>(rows), WG);
++    sycl::range<2> local_size(1, WG);
++    auto cgf = [&](sycl::handler& handle) {
++        sycl::ext::oneapi::experimental::properties props{
++            sycl::ext::intel::experimental::grf_size<OMNI_CONVROT_QUANT_GRF>};
++        handle.parallel_for(
++            sycl::nd_range<2>(global_size, local_size),
++            props,
++            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
++                constexpr int kSlmBytes = (WG * 4 < 16) ? 16 : WG * 4;
++                slm_init<kSlmBytes>();
++                const int64_t row = item.get_global_id(0);
++                const int t = static_cast<int>(item.get_local_id(1));
++                const int64_t in_start = row * in_row_stride;
++                const int64_t out_start = row * groups * GroupSize;
++                const int g0 = t * gpw;
++                const int g1 = static_cast<int>(
++                    (g0 + gpw < groups) ? (g0 + gpw) : groups);
++
++                simd<InputT, GroupSize> cache[kCache];
++                float local_max = 0.0f;
++                if (use_cache) {
++#pragma unroll
++                    for (int i = 0; i < kCache; ++i) {
++                        const int g = g0 + i;
++                        if (g < g1) {
++                            cache[i] = load_silu_mul_rotated_rounded_vec<InputT, GroupSize>(
++                                gate + in_start + g * GroupSize,
++                                up + in_start + g * GroupSize);
++                            simd<float, GroupSize> values = cache[i];
++                            const float group_max = hmax<float>(
++                                sycl::ext::intel::esimd::abs<float, GroupSize>(values));
++                            local_max = group_max > local_max ? group_max : local_max;
++                        }
++                    }
++                } else {
++                    for (int g = g0; g < g1; ++g) {
++                        simd<float, GroupSize> values =
++                            load_silu_mul_rotated_rounded_vec<InputT, GroupSize>(
++                                gate + in_start + g * GroupSize,
++                                up + in_start + g * GroupSize);
++                        const float group_max = hmax<float>(
++                            sycl::ext::intel::esimd::abs<float, GroupSize>(values));
++                        local_max = group_max > local_max ? group_max : local_max;
++                    }
++                }
++                slm_block_store<float, 1>(t * sizeof(float), local_max);
++                barrier();
++                simd<float, WG> partials = slm_block_load<float, WG>(0);
++                const float row_max = hmax<float>(partials);
++
++                float scale = row_max / 127.0f;
++                if (scale < 1e-30f) scale = 1e-30f;
++                const float inv_scale = 1.0f / scale;
++                if (t == 0) scales[row] = scale;
++
++                if (use_cache) {
++#pragma unroll
++                    for (int i = 0; i < kCache; ++i) {
++                        const int g = g0 + i;
++                        if (g < g1) {
++                            quantize_store_rounded<InputT, GroupSize>(
++                                cache[i], output, out_start + g * GroupSize, inv_scale);
++                        }
++                    }
++                } else {
++                    for (int g = g0; g < g1; ++g) {
++                        quantize_store_rounded<InputT, GroupSize>(
++                            load_silu_mul_rotated_rounded_vec<InputT, GroupSize>(
++                                gate + in_start + g * GroupSize,
++                                up + in_start + g * GroupSize),
++                            output, out_start + g * GroupSize, inv_scale);
++                    }
++                }
++            });
++    };
++    utils::submit_kernel(cgf, device, "int8_convrot_silu_mul_quantize_rowsplit");
++}
++
++template<typename InputT, int GroupSize>
++void dispatch_silu_rowsplit(
++    const InputT* gate, const InputT* up, int64_t in_row_stride, int8_t* output, float* scales,
++    int64_t rows, int64_t groups, int row_split, const at::Device& device) {
++    switch (row_split) {
++        case 4:  quantize_convrot_silu_mul_rowsplit_kernel<InputT, GroupSize, 4>(gate, up, in_row_stride, output, scales, rows, groups, device); break;
++        case 16: quantize_convrot_silu_mul_rowsplit_kernel<InputT, GroupSize, 16>(gate, up, in_row_stride, output, scales, rows, groups, device); break;
++        case 32: quantize_convrot_silu_mul_rowsplit_kernel<InputT, GroupSize, 32>(gate, up, in_row_stride, output, scales, rows, groups, device); break;
++        default: quantize_convrot_silu_mul_rowsplit_kernel<InputT, GroupSize, 8>(gate, up, in_row_stride, output, scales, rows, groups, device); break;
++    }
++}
++
++}  // namespace
++
++// fc1_out: [M, 2K] bf16/fp16 contiguous ([gate | up]); returns int8 [M, K] + scales [M, 1].
++// gate_second != 0: the row is [up | gate] (MiniMax Music 3 GLU) instead of [gate | up].
++std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_silu_mul_split(
++    torch::Tensor fc1_out,
++    int64_t group_size,
++    int64_t row_split,
++    int64_t gate_second) {
++    TORCH_CHECK(fc1_out.device().is_xpu(), "input must be on XPU");
++    TORCH_CHECK(fc1_out.dim() == 2, "input must be 2D [M, 2K]");
++    TORCH_CHECK(
++        fc1_out.scalar_type() == torch::kBFloat16 ||
++            fc1_out.scalar_type() == torch::kFloat16,
++        "input must be bf16 or fp16");
++    TORCH_CHECK(group_size == 64 || group_size == 256, "group size must be 64 or 256");
++    TORCH_CHECK(fc1_out.size(1) % 2 == 0 && (fc1_out.size(1) / 2) % group_size == 0,
++                "half width must be divisible by group size");
++    TORCH_CHECK(row_split == 4 || row_split == 8 || row_split == 16 || row_split == 32,
++                "row_split must be 4, 8, 16 or 32");
++    fc1_out = fc1_out.contiguous();
++    const int64_t rows = fc1_out.size(0);
++    const int64_t width = fc1_out.size(1) / 2;
++    const int64_t groups = width / group_size;
++    auto output = torch::empty({rows, width}, fc1_out.options().dtype(torch::kInt8));
++    auto scales = torch::empty({rows, 1}, fc1_out.options().dtype(torch::kFloat));
++    if (fc1_out.numel() == 0) return {output, scales};
++    auto* out_ptr = reinterpret_cast<int8_t*>(output.data_ptr());
++    auto* scale_ptr = scales.data_ptr<float>();
++    const int rs = static_cast<int>(row_split);
++    const int64_t stride = fc1_out.size(1);
++    if (fc1_out.scalar_type() == torch::kBFloat16) {
++        const auto* first = reinterpret_cast<const bf16*>(fc1_out.data_ptr());
++        const auto* base = gate_second ? first + width : first;
++        const auto* upp = gate_second ? first : first + width;
++        if (group_size == 64) dispatch_silu_rowsplit<bf16, 64>(base, upp, stride, out_ptr, scale_ptr, rows, groups, rs, fc1_out.device());
++        else dispatch_silu_rowsplit<bf16, 256>(base, upp, stride, out_ptr, scale_ptr, rows, groups, rs, fc1_out.device());
++    } else {
++        const auto* first = reinterpret_cast<const fp16*>(fc1_out.data_ptr());
++        const auto* base = gate_second ? first + width : first;
++        const auto* upp = gate_second ? first : first + width;
++        if (group_size == 64) dispatch_silu_rowsplit<fp16, 64>(base, upp, stride, out_ptr, scale_ptr, rows, groups, rs, fc1_out.device());
++        else dispatch_silu_rowsplit<fp16, 256>(base, upp, stride, out_ptr, scale_ptr, rows, groups, rs, fc1_out.device());
++    }
++    return {output, scales};
++}
++
++namespace {
++// ---------------------------------------------------------------------------
++// [x += gate*other] -> RMSNorm -> *(1+scale)+shift -> Hadamard -> INT8 (2026-09-06)
++// One row per work-group of WG work-items; thread t owns groups [t*gpw, ...).
++// ---------------------------------------------------------------------------
++template<typename InputT, int GroupSize, int WG, bool Residual>
++void norm_mod_convrot_quant_kernel(
++    InputT* __restrict__ x,
++    const InputT* __restrict__ other,
++    const InputT* __restrict__ gate,
++    const InputT* __restrict__ weight,
++    const InputT* __restrict__ scale_t,
++    const InputT* __restrict__ shift_t,
++    const int32_t* __restrict__ seg_end,
++    const int32_t* __restrict__ seg_mod,
++    int8_t* __restrict__ output,
++    float* __restrict__ scales,
++    int64_t rows,
++    int64_t groups,
++    float eps,
++    const at::Device& device) {
++    constexpr int kCache = 4;
++    const int gpw = static_cast<int>((groups + WG - 1) / WG);
++    TORCH_CHECK(gpw <= kCache, "norm_mod_convrot_quant: too many groups per work-item; raise row_split");
++    const int64_t hidden = groups * GroupSize;
++    sycl::range<2> global_size(static_cast<size_t>(rows), WG);
++    sycl::range<2> local_size(1, WG);
++    auto cgf = [&](sycl::handler& handle) {
++        sycl::ext::oneapi::experimental::properties props{
++            sycl::ext::intel::experimental::grf_size<OMNI_CONVROT_QUANT_GRF>};
++        handle.parallel_for(
++            sycl::nd_range<2>(global_size, local_size),
++            props,
++            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
++                constexpr int kSlmBytes = (2 * WG * 4 < 32) ? 32 : 2 * WG * 4;
++                slm_init<kSlmBytes>();
++                const int64_t row = item.get_global_id(0);
++                const int t = static_cast<int>(item.get_local_id(1));
++                const int g0 = t * gpw;
++                const int g1 = static_cast<int>(
++                    (g0 + gpw < groups) ? (g0 + gpw) : groups);
++
++                simd<int32_t, 8> ends = block_load<int32_t, 8>(seg_end);
++                simd<int32_t, 8> mods = block_load<int32_t, 8>(seg_mod);
++                int seg = 0;
++#pragma unroll
++                for (int s = 0; s < 7; ++s) {
++                    if (row >= ends[s]) seg = s + 1;
++                }
++                const int64_t mod = mods[seg];
++                const int64_t row_start = row * hidden;
++                const int64_t mod_start = mod * hidden;
++
++                simd<InputT, GroupSize> cache[kCache];
++                float sumsq = 0.0f;
++#pragma unroll
++                for (int i = 0; i < kCache; ++i) {
++                    const int g = g0 + i;
++                    if (g < g1) {
++                        const int64_t off = row_start + g * GroupSize;
++                        simd<InputT, GroupSize> xv = block_load<InputT, GroupSize>(x + off);
++                        if constexpr (Residual) {
++                            simd<float, GroupSize> xf = xv;
++                            simd<float, GroupSize> of = block_load<InputT, GroupSize>(other + off);
++                            simd<float, GroupSize> gf = block_load<InputT, GroupSize>(gate + mod_start + g * GroupSize);
++                            xv = xf + of * gf;  // bf16 rounding = stock addcmul_ output
++                            block_store<InputT, GroupSize>(x + off, xv);
++                        }
++                        cache[i] = xv;
++                        simd<float, GroupSize> xr = xv;
++                        sumsq += sycl::ext::intel::esimd::detail::sum<float, float, GroupSize>(xr * xr);
++                    }
++                }
++                slm_block_store<float, 1>(t * sizeof(float), sumsq);
++                barrier();
++                simd<float, WG> parts = slm_block_load<float, WG>(0);
++                const float mean = sycl::ext::intel::esimd::detail::sum<float, float, WG>(parts) / static_cast<float>(hidden);
++                const float inv_rms = rsqrt(mean + eps);
++
++                float local_max = 0.0f;
++#pragma unroll
++                for (int i = 0; i < kCache; ++i) {
++                    const int g = g0 + i;
++                    if (g < g1) {
++                        const int64_t col = g * GroupSize;
++                        simd<float, GroupSize> xr = cache[i];
++                        simd<float, GroupSize> wv = block_load<InputT, GroupSize>(weight + col);
++                        simd<float, GroupSize> sv = block_load<InputT, GroupSize>(scale_t + mod_start + col);
++                        simd<float, GroupSize> hv = block_load<InputT, GroupSize>(shift_t + mod_start + col);
++                        simd<InputT, GroupSize> h = xr * inv_rms * wv * (sv + 1.0f) + hv;  // stock norm output boundary
++                        simd<float, GroupSize> values = h;
++                        radix4_stage_vec<1, GroupSize>(values);
++                        values *= 1.0f / sycl::sqrt(static_cast<float>(GroupSize));
++                        simd<InputT, GroupSize> rounded = values;
++                        cache[i] = rounded;
++                        simd<float, GroupSize> rf = rounded;
++                        const float gmax = hmax<float>(sycl::ext::intel::esimd::abs<float, GroupSize>(rf));
++                        local_max = gmax > local_max ? gmax : local_max;
++                    }
++                }
++                slm_block_store<float, 1>((WG + t) * sizeof(float), local_max);
++                barrier();
++                simd<float, WG> maxes = slm_block_load<float, WG>(WG * sizeof(float));
++                const float row_max = hmax<float>(maxes);
++                float qscale = row_max / 127.0f;
++                if (qscale < 1e-30f) qscale = 1e-30f;
++                const float inv_scale = 1.0f / qscale;
++                if (t == 0) scales[row] = qscale;
++#pragma unroll
++                for (int i = 0; i < kCache; ++i) {
++                    const int g = g0 + i;
++                    if (g < g1) {
++                        quantize_store_rounded<InputT, GroupSize>(
++                            cache[i], output, row_start + g * GroupSize, inv_scale);
++                    }
++                }
++            });
++    };
++    utils::submit_kernel(cgf, device, Residual ? "gate_norm_mod_convrot_quant" : "norm_mod_convrot_quant");
++}
++
++template<typename InputT, int GroupSize, bool Residual>
++void dispatch_norm_quant(
++    InputT* x, const InputT* other, const InputT* gate, const InputT* weight, const InputT* scale_t,
++    const InputT* shift_t, const int32_t* seg_end, const int32_t* seg_mod, int8_t* output, float* scales,
++    int64_t rows, int64_t groups, float eps, int row_split, const at::Device& device) {
++    switch (row_split) {
++        case 8:  norm_mod_convrot_quant_kernel<InputT, GroupSize, 8, Residual>(x, other, gate, weight, scale_t, shift_t, seg_end, seg_mod, output, scales, rows, groups, eps, device); break;
++        case 32: norm_mod_convrot_quant_kernel<InputT, GroupSize, 32, Residual>(x, other, gate, weight, scale_t, shift_t, seg_end, seg_mod, output, scales, rows, groups, eps, device); break;
++        default: norm_mod_convrot_quant_kernel<InputT, GroupSize, 16, Residual>(x, other, gate, weight, scale_t, shift_t, seg_end, seg_mod, output, scales, rows, groups, eps, device); break;
++    }
++}
++
++}  // namespace
++
++// x [M, H] (updated in place when `other` is given), other/gate optional, weight [H], scale/shift
++// [mod_rows, H], seg_end/seg_mod int32[8]; returns (int8 [M, H], scales [M, 1]).
++std::tuple<torch::Tensor, torch::Tensor> rms_norm_mod_convrot_quant(
++    torch::Tensor x,
++    std::optional<torch::Tensor> other,
++    std::optional<torch::Tensor> gate,
++    torch::Tensor weight,
++    torch::Tensor scale,
++    torch::Tensor shift,
++    torch::Tensor seg_end,
++    torch::Tensor seg_mod,
++    double eps,
++    int64_t group_size,
++    int64_t row_split) {
++    TORCH_CHECK(x.device().is_xpu() && x.dim() == 2 && x.is_contiguous(), "x must be a contiguous 2D XPU tensor");
++    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat16, "x must be bf16/fp16");
++    TORCH_CHECK(group_size == 256 || group_size == 64, "group size must be 64 or 256");
++    const int64_t rows = x.size(0), hidden = x.size(1);
++    TORCH_CHECK(hidden % group_size == 0, "hidden must be divisible by group size");
++    TORCH_CHECK(weight.is_contiguous() && weight.numel() == hidden && weight.scalar_type() == x.scalar_type(), "bad weight");
++    TORCH_CHECK(scale.dim() == 2 && scale.size(1) == hidden && scale.is_contiguous() && scale.scalar_type() == x.scalar_type(), "bad scale");
++    TORCH_CHECK(shift.sizes() == scale.sizes() && shift.is_contiguous() && shift.scalar_type() == x.scalar_type(), "bad shift");
++    TORCH_CHECK(seg_end.scalar_type() == torch::kInt32 && seg_end.numel() == 8 && seg_end.is_contiguous() &&
++                seg_mod.scalar_type() == torch::kInt32 && seg_mod.numel() == 8 && seg_mod.is_contiguous(), "seg arrays must be int32[8]");
++    const bool residual = other.has_value();
++    if (residual) {
++        TORCH_CHECK(gate.has_value(), "gate required with other");
++        TORCH_CHECK(other->sizes() == x.sizes() && other->is_contiguous() && other->scalar_type() == x.scalar_type(), "bad other");
++        TORCH_CHECK(gate->sizes() == scale.sizes() && gate->is_contiguous() && gate->scalar_type() == x.scalar_type(), "bad gate");
++    }
++    TORCH_CHECK(row_split == 8 || row_split == 16 || row_split == 32, "row_split must be 8, 16 or 32");
++    auto output = torch::empty({rows, hidden}, x.options().dtype(torch::kInt8));
++    auto scales = torch::empty({rows, 1}, x.options().dtype(torch::kFloat));
++    if (x.numel() == 0) return {output, scales};
++    const int64_t groups = hidden / group_size;
++    auto* out_ptr = reinterpret_cast<int8_t*>(output.data_ptr());
++    auto* sc_ptr = scales.data_ptr<float>();
++    const auto* se = seg_end.data_ptr<int32_t>();
++    const auto* sm = seg_mod.data_ptr<int32_t>();
++    const int rs = static_cast<int>(row_split);
++#define OMNI_NQ_DISPATCH(T, GS)                                                                        \
++    {                                                                                                   \
++        auto* xp = reinterpret_cast<T*>(x.data_ptr());                                                  \
++        const T* op = residual ? reinterpret_cast<const T*>(other->data_ptr()) : nullptr;               \
++        const T* gp = residual ? reinterpret_cast<const T*>(gate->data_ptr()) : nullptr;                \
++        const auto* wp = reinterpret_cast<const T*>(weight.data_ptr());                                 \
++        const auto* sp = reinterpret_cast<const T*>(scale.data_ptr());                                  \
++        const auto* hp = reinterpret_cast<const T*>(shift.data_ptr());                                  \
++        if (residual) dispatch_norm_quant<T, GS, true>(xp, op, gp, wp, sp, hp, se, sm, out_ptr, sc_ptr, rows, groups, static_cast<float>(eps), rs, x.device()); \
++        else dispatch_norm_quant<T, GS, false>(xp, op, gp, wp, sp, hp, se, sm, out_ptr, sc_ptr, rows, groups, static_cast<float>(eps), rs, x.device()); \
++    }
++    if (x.scalar_type() == torch::kBFloat16) {
++        if (group_size == 64) OMNI_NQ_DISPATCH(bf16, 64) else OMNI_NQ_DISPATCH(bf16, 256)
++    } else {
++        if (group_size == 64) OMNI_NQ_DISPATCH(fp16, 64) else OMNI_NQ_DISPATCH(fp16, 256)
++    }
++#undef OMNI_NQ_DISPATCH
++    return {output, scales};
++}
++
++namespace {
++}  // namespace
++
++std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused_split(
++    torch::Tensor input,
++    int64_t group_size,
++    int64_t row_split) {
++    TORCH_CHECK(input.device().is_xpu(), "input must be on XPU");
++    TORCH_CHECK(input.dim() == 2, "input must be 2D");
++    TORCH_CHECK(
++        input.scalar_type() == torch::kBFloat16 ||
++            input.scalar_type() == torch::kFloat16,
++        "input must be bf16 or fp16");
++    TORCH_CHECK(
++        group_size == 64 || group_size == 256,
++        "fused ConvRot quantization supports group sizes 64 and 256");
++    TORCH_CHECK(input.size(1) % group_size == 0, "invalid group size");
++    TORCH_CHECK(
++        row_split == 4 || row_split == 8 || row_split == 16 || row_split == 32,
++        "row_split must be 4, 8, 16 or 32");
++    input = input.contiguous();
++    auto output = torch::empty_like(
++        input, input.options().dtype(torch::kInt8));
++    auto scales = torch::empty(
++        {input.size(0), 1}, input.options().dtype(torch::kFloat));
++    if (input.numel() == 0) return {output, scales};
++    const int64_t rows = input.size(0);
++    const int64_t groups = input.size(1) / group_size;
++    auto* out_ptr = reinterpret_cast<int8_t*>(output.data_ptr());
++    auto* scale_ptr = scales.data_ptr<float>();
++    const int rs = static_cast<int>(row_split);
++    if (input.scalar_type() == torch::kBFloat16) {
++        const auto* in_ptr = reinterpret_cast<const bf16*>(input.data_ptr());
++        if (group_size == 64) dispatch_rowsplit<bf16, 64>(in_ptr, out_ptr, scale_ptr, rows, groups, rs, input.device());
++        else dispatch_rowsplit<bf16, 256>(in_ptr, out_ptr, scale_ptr, rows, groups, rs, input.device());
++    } else {
++        const auto* in_ptr = reinterpret_cast<const fp16*>(input.data_ptr());
++        if (group_size == 64) dispatch_rowsplit<fp16, 64>(in_ptr, out_ptr, scale_ptr, rows, groups, rs, input.device());
++        else dispatch_rowsplit<fp16, 256>(in_ptr, out_ptr, scale_ptr, rows, groups, rs, input.device());
++    }
++    return {output, scales};
++}
++
++namespace {
+ }  // namespace
+ 
+ std::tuple<torch::Tensor, torch::Tensor> quantize_int8_convrot_fused(
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp b/omni_xpu_kernel/omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp
+--- a/omni_xpu_kernel/omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp	2026-08-04 05:47:48.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/csrc/kitchen_rms_rope_sycl.cpp	2026-09-06 13:22:41.284070937 +0000
+@@ -2,6 +2,7 @@
+ #include <sycl/sycl.hpp>
+ 
+ #include <cstdint>
++#include <cstdlib>
+ 
+ #include "utils.h"
+ 
+@@ -269,6 +270,106 @@
+     utils::submit_kernel(
+         cgf, q.device(), "kitchen_rms_rope_h3_cached_input_bmg");
+ }
++
++// Sub-group-per-row variant (2026-09-06). Lane l of a 16-lane sub-group owns
++// columns l + 16*j (j = 0..7): pair (c, c+48) lives in one lane (j and j+3),
++// columns 96..127 (j = 6, 7) are only normalized. No SLM, no barriers.
++void launch_minimax_h3_rms_rope_sg(
++    const torch::Tensor& q,
++    const torch::Tensor& k,
++    const torch::Tensor& freqs,
++    const torch::Tensor& q_scale,
++    const torch::Tensor& k_scale,
++    float epsilon) {
++    const auto* q_ptr = reinterpret_cast<const bf16*>(q.data_ptr());
++    const auto* k_ptr = reinterpret_cast<const bf16*>(k.data_ptr());
++    const auto* f_ptr = reinterpret_cast<const bf16*>(freqs.data_ptr());
++    const auto* qs_ptr = reinterpret_cast<const bf16*>(q_scale.data_ptr());
++    const auto* ks_ptr = reinterpret_cast<const bf16*>(k_scale.data_ptr());
++    auto* qo_ptr = reinterpret_cast<bf16*>(q.data_ptr());
++    auto* ko_ptr = reinterpret_cast<bf16*>(k.data_ptr());
++    const int64_t rows_per_operand = q.size(1) * H3_HEADS;
++    const int64_t total_rows = 2 * rows_per_operand;
++    constexpr int SG = 16;
++    constexpr int ROWS_PER_WG = 16;
++    constexpr int WG = SG * ROWS_PER_WG;
++    const int64_t groups = (total_rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
++
++    auto cgf = [&](sycl::handler& handler) {
++        handler.parallel_for(
++            sycl::nd_range<1>(
++                sycl::range<1>(static_cast<size_t>(groups * WG)),
++                sycl::range<1>(WG)),
++            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
++                auto sg = item.get_sub_group();
++                const int lane = static_cast<int>(sg.get_local_id()[0]);
++                const int64_t global_row =
++                    static_cast<int64_t>(item.get_group(0)) * ROWS_PER_WG +
++                    static_cast<int64_t>(sg.get_group_id()[0]);
++                if (global_row >= total_rows) return;  // uniform per sub-group
++
++                const bool is_key = global_row >= rows_per_operand;
++                const int64_t row = is_key
++                    ? global_row - rows_per_operand
++                    : global_row;
++                const int64_t token = row / H3_HEADS;
++                const int64_t head = row - token * H3_HEADS;
++                const int64_t base =
++                    token * H3_PACKED_SEQUENCE_STRIDE + head * H3_HEAD_DIM;
++                const bf16* source = is_key ? k_ptr : q_ptr;
++                bf16* destination = is_key ? ko_ptr : qo_ptr;
++                const bf16* scale = is_key ? ks_ptr : qs_ptr;
++
++                float v[8];
++                float square_sum = 0.0f;
++#pragma unroll
++                for (int j = 0; j < 8; ++j) {
++                    v[j] = static_cast<float>(source[base + lane + 16 * j]);
++                    square_sum += v[j] * v[j];
++                }
++                square_sum = sycl::reduce_over_group(sg, square_sum, sycl::plus<float>());
++                const float inverse_rms =
++                    sycl::rsqrt(square_sum / H3_HEAD_DIM + epsilon);
++
++#pragma unroll
++                for (int j = 0; j < 3; ++j) {
++                    const int col0 = lane + 16 * j;
++                    const int col1 = col0 + static_cast<int>(H3_ROTARY_PAIRS);
++                    const bf16 normalized0 = static_cast<bf16>(
++                        v[j] * inverse_rms * static_cast<float>(scale[col0]));
++                    const bf16 normalized1 = static_cast<bf16>(
++                        v[j + 3] * inverse_rms * static_cast<float>(scale[col1]));
++                    const float rotated0 = static_cast<float>(normalized0);
++                    const float rotated1 = static_cast<float>(normalized1);
++                    const int64_t freq_base =
++                        token * H3_ROTARY_PAIRS * 4 + static_cast<int64_t>(col0) * 4;
++                    const float f00 = static_cast<float>(f_ptr[freq_base]);
++                    const float f01 = static_cast<float>(f_ptr[freq_base + 1]);
++                    const float f10 = static_cast<float>(f_ptr[freq_base + 2]);
++                    const float f11 = static_cast<float>(f_ptr[freq_base + 3]);
++                    destination[base + col0] = static_cast<bf16>(
++                        f00 * rotated0 + f01 * rotated1);
++                    destination[base + col1] = static_cast<bf16>(
++                        f10 * rotated0 + f11 * rotated1);
++                }
++#pragma unroll
++                for (int j = 6; j < 8; ++j) {
++                    const int col = lane + 16 * j;
++                    destination[base + col] = static_cast<bf16>(
++                        v[j] * inverse_rms * static_cast<float>(scale[col]));
++                }
++            });
++    };
++    utils::submit_kernel(cgf, q.device(), "kitchen_rms_rope_h3_subgroup_bmg");
++}
++
++inline bool use_h3_rms_rope_subgroup() {
++    static const bool enabled = [] {
++        const char* e = std::getenv("OMNI_H3_RMS_ROPE_SG");
++        return !(e && e[0] == '0');
++    }();
++    return enabled;
++}
+ #endif
+ 
+ template <typename InputT, typename FreqT, bool SplitHalf, bool Pair>
+@@ -521,9 +622,15 @@
+     if (is_minimax_h3_rms_rope_contract(
+             q, k, freqs_cis, q_scale, k_scale, rot_dim,
+             split_half, inplace)) {
+-        launch_minimax_h3_rms_rope(
+-            q, k, freqs_cis, q_scale, k_scale,
+-            static_cast<float>(epsilon));
++        if (use_h3_rms_rope_subgroup()) {
++            launch_minimax_h3_rms_rope_sg(
++                q, k, freqs_cis, q_scale, k_scale,
++                static_cast<float>(epsilon));
++        } else {
++            launch_minimax_h3_rms_rope(
++                q, k, freqs_cis, q_scale, k_scale,
++                static_cast<float>(epsilon));
++        }
+         return {q_out, k_out};
+     }
+ #endif
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/csrc/norm.cpp b/omni_xpu_kernel/omni_xpu_kernel/csrc/norm.cpp
+--- a/omni_xpu_kernel/omni_xpu_kernel/csrc/norm.cpp	2026-08-04 05:55:23.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/csrc/norm.cpp	2026-09-06 13:11:21.866863311 +0000
+@@ -1177,5 +1177,163 @@
+     return output;
+ }
+ 
++// ============================================================================
++// RMSNorm + AdaLN modulation (2026-09-06): out = norm(x)*w*(1+scale[mod]) + shift[mod]
++// mod = seg_mod[first s with row < seg_end[s]]; <= 8 segments, arrays padded to 8.
++// ============================================================================
++template<typename IT, const int GS, const int BS>
++void rms_norm_mod_kernel(
++    const void* weight_ptr,
++    const void* input_ptr,
++    void* output_ptr,
++    const void* scale_ptr,
++    const void* shift_ptr,
++    const int32_t* seg_end,
++    const int32_t* seg_mod,
++    float eps,
++    const int input_size,
++    const int hidden_size,
++    const at::Device& device
++) {
++    const int nb = hidden_size / BS;
++    const int sub_nb = nb / GS;
++    const int rem_nb = nb % GS;
++    constexpr int slm_acc_align = ((GS * (int)sizeof(float) + 15) / 16) * 16;
++    const int acc_offset = hidden_size * sizeof(IT);
++
++    sycl::range<2> global_size(input_size, GS);
++    sycl::range<2> local_size(1, GS);
++
++    auto cgf = [&](sycl::handler& handle) {
++        handle.parallel_for(
++            sycl::nd_range<2>(global_size, local_size),
++            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
++                slm_init<8 * 1024 * sizeof(IT) + slm_acc_align>();
++
++                const int rid = item.get_global_id(0);
++                const int tid = item.get_local_id(1);
++
++                simd<int32_t, 8> ends = block_load<int32_t, 8>(seg_end);
++                simd<int32_t, 8> mods = block_load<int32_t, 8>(seg_mod);
++                int seg = 0;
++#pragma unroll
++                for (int s = 0; s < 7; ++s) {
++                    if (rid >= ends[s]) seg = s + 1;
++                }
++                // `seg` is the first segment whose end is beyond rid because ends are ascending.
++                const int mod = mods[seg];
++
++                const IT* weight = (const IT*)weight_ptr;
++                const IT* input = (const IT*)input_ptr + hidden_size * (size_t)rid;
++                const IT* sc = (const IT*)scale_ptr + hidden_size * (size_t)mod;
++                const IT* sh = (const IT*)shift_ptr + hidden_size * (size_t)mod;
++                IT* output = (IT*)output_ptr + hidden_size * (size_t)rid;
++
++                const int start_blk = sub_nb * tid + std::min(tid, rem_nb);
++                const int end_blk = start_blk + sub_nb + (tid < rem_nb);
++
++                simd<float, BS> accv = 0;
++                for (int i = start_blk; i < end_blk; ++i) {
++                    simd<IT, BS> xv = block_load<IT, BS>(input + i * BS);
++                    slm_block_store<IT, BS>(i * BS * sizeof(IT), xv);
++                    simd<float, BS> xv_f32 = xv;
++                    accv += xv_f32 * xv_f32;
++                }
++                float acc = sycl::ext::intel::esimd::detail::sum<float, float, BS>(accv) / hidden_size;
++
++                float scale;
++                if constexpr (GS == 1) {
++                    scale = rsqrt(acc + eps);
++                } else {
++                    slm_block_store<float, 1>(acc_offset + tid * sizeof(float), acc);
++                    barrier();
++                    simd<float, GS> accs = slm_block_load<float, GS>(acc_offset);
++                    float mean = sycl::ext::intel::esimd::detail::sum<float, float, GS>(accs);
++                    scale = rsqrt(mean + eps);
++                }
++                for (int i = start_blk; i < end_blk; ++i) {
++                    simd<float, BS> xv = slm_block_load<IT, BS>(i * BS * sizeof(IT));
++                    simd<float, BS> yv = block_load<IT, BS>(weight + i * BS);
++                    simd<float, BS> sv = block_load<IT, BS>(sc + i * BS);
++                    simd<float, BS> hv = block_load<IT, BS>(sh + i * BS);
++                    simd<IT, BS> result = xv * scale * yv * (sv + 1.0f) + hv;
++                    block_store<IT, BS>(output + i * BS, result);
++                }
++            }
++        );
++    };
++    utils::submit_kernel(cgf, device, "rms_norm_mod_esimd");
++}
++
++template<typename IT, int BS>
++using rms_mod_fn_t = void(*)(const void*, const void*, void*, const void*, const void*,
++                             const int32_t*, const int32_t*, float, const int, const int, const at::Device&);
++
++template<typename IT, int BS>
++rms_mod_fn_t<IT, BS> select_rms_mod_kernel(int nb) {
++    if (nb <= 1)  return rms_norm_mod_kernel<IT, 1,  BS>;
++    if (nb <= 2)  return rms_norm_mod_kernel<IT, 2,  BS>;
++    if (nb <= 4)  return rms_norm_mod_kernel<IT, 4,  BS>;
++    if (nb <= 8)  return rms_norm_mod_kernel<IT, 8,  BS>;
++    if (nb <= 16) return rms_norm_mod_kernel<IT, 16, BS>;
++    return rms_norm_mod_kernel<IT, 32, BS>;
++}
++
++torch::Tensor rms_norm_mod(
++    torch::Tensor weight,
++    torch::Tensor input,
++    torch::Tensor scale,
++    torch::Tensor shift,
++    torch::Tensor seg_end,
++    torch::Tensor seg_mod,
++    double eps
++) {
++    TORCH_CHECK(input.dim() == 2, "input must be 2D [rows, hidden]");
++    TORCH_CHECK(weight.dim() == 1 && weight.size(0) == input.size(1), "weight must be [hidden]");
++    TORCH_CHECK(scale.dim() == 2 && shift.dim() == 2 && scale.size(1) == input.size(1) &&
++                shift.sizes() == scale.sizes(), "scale/shift must be [mod_rows, hidden]");
++    TORCH_CHECK(input.scalar_type() == weight.scalar_type() && scale.scalar_type() == input.scalar_type() &&
++                shift.scalar_type() == input.scalar_type(), "dtypes must match");
++    TORCH_CHECK(input.is_contiguous() && weight.is_contiguous() && scale.is_contiguous() && shift.is_contiguous(),
++                "tensors must be contiguous");
++    TORCH_CHECK(seg_end.scalar_type() == torch::kInt32 && seg_mod.scalar_type() == torch::kInt32 &&
++                seg_end.numel() == 8 && seg_mod.numel() == 8 && seg_end.is_contiguous() && seg_mod.is_contiguous() &&
++                seg_end.device() == input.device() && seg_mod.device() == input.device(),
++                "seg_end/seg_mod must be int32[8] on the input device");
++    const int64_t input_size = input.size(0);
++    const int64_t hidden_size = input.size(1);
++    TORCH_CHECK(hidden_size > 0 && hidden_size <= 8192 && hidden_size % 32 == 0,
++                "hidden_size must be <= 8192 and divisible by 32");
++    auto output = torch::empty({input_size, hidden_size},
++        torch::device(input.device()).dtype(input.dtype()));
++    if (input_size == 0) return output;
++    const auto* se = seg_end.data_ptr<int32_t>();
++    const auto* sm = seg_mod.data_ptr<int32_t>();
++#define OMNI_RMS_MOD_DISPATCH(T, BSV)                                                     \
++    {                                                                                      \
++        auto fn = select_rms_mod_kernel<T, BSV>(hidden_size / BSV);                        \
++        fn(weight.data_ptr(), input.data_ptr(), output.data_ptr(), scale.data_ptr(),      \
++           shift.data_ptr(), se, sm, static_cast<float>(eps), input_size, hidden_size,    \
++           input.device());                                                                \
++    }
++    if (hidden_size % 64 == 0 && hidden_size >= 2048) {
++        switch (input.scalar_type()) {
++            case ST::Float: OMNI_RMS_MOD_DISPATCH(float, 64); break;
++            case ST::Half: OMNI_RMS_MOD_DISPATCH(fp16, 64); break;
++            case ST::BFloat16: OMNI_RMS_MOD_DISPATCH(bf16, 64); break;
++            default: TORCH_CHECK(false, "Unsupported dtype");
++        }
++    } else {
++        switch (input.scalar_type()) {
++            case ST::Float: OMNI_RMS_MOD_DISPATCH(float, 32); break;
++            case ST::Half: OMNI_RMS_MOD_DISPATCH(fp16, 32); break;
++            case ST::BFloat16: OMNI_RMS_MOD_DISPATCH(bf16, 32); break;
++            default: TORCH_CHECK(false, "Unsupported dtype");
++        }
++    }
++#undef OMNI_RMS_MOD_DISPATCH
++    return output;
++}
++
+ }  // namespace norm
+ }  // namespace omni_xpu
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/csrc/onednn_int8.cpp b/omni_xpu_kernel/omni_xpu_kernel/csrc/onednn_int8.cpp
+--- a/omni_xpu_kernel/omni_xpu_kernel/csrc/onednn_int8.cpp	2026-08-07 00:52:57.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/csrc/onednn_int8.cpp	2026-09-06 13:05:23.071071514 +0000
+@@ -141,6 +141,8 @@
+     dnnl::matmul primitive;
+     bool has_bias;
+     bool w_scale_is_scalar;
++    int postop = 0;  // 0 none, 1 swish, 2 binary_mul(binary_md)
++    dnnl::memory::desc binary_md;
+ };
+ 
+ struct Int8PairState {
+@@ -162,13 +164,15 @@
+     int64_t n;
+     bool has_bias;
+     bool w_scale_is_scalar;
++    int postop;
+ 
+     bool operator==(const Int8ScaledCacheKey& other) const {
+         return device_index == other.device_index
+             && out_dtype == other.out_dtype
+             && m == other.m && k == other.k && n == other.n
+             && has_bias == other.has_bias
+-            && w_scale_is_scalar == other.w_scale_is_scalar;
++            && w_scale_is_scalar == other.w_scale_is_scalar
++            && postop == other.postop;
+     }
+ };
+ 
+@@ -185,6 +189,7 @@
+         combine(std::hash<int64_t>{}(key.n));
+         combine(std::hash<bool>{}(key.has_bias));
+         combine(std::hash<bool>{}(key.w_scale_is_scalar));
++        combine(std::hash<int>{}(key.postop));
+         return seed;
+     }
+ };
+@@ -234,9 +239,10 @@
+     bool has_bias,
+     bool w_scale_is_scalar,
+     const torch::Device& device,
+-    const sycl::queue& queue
++    const sycl::queue& queue,
++    int postop = 0
+ ) {
+-    Int8ScaledCacheKey key{device.index(), out_dtype_code, m, k, n, has_bias, w_scale_is_scalar};
++    Int8ScaledCacheKey key{device.index(), out_dtype_code, m, k, n, has_bias, w_scale_is_scalar, postop};
+ 
+     auto& cache = int8_scaled_cache();
+     auto& counters = int8_cache_counters();
+@@ -293,6 +299,17 @@
+         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 1), {}, DT::f32);
+     }
+     attr.set_fpmath_mode(dnnl::fpmath_mode::any, true);
++    state->postop = postop;
++    if (postop == 1) {
++        dnnl::post_ops po;
++        po.append_eltwise(dnnl::algorithm::eltwise_swish, 1.0f, 0.0f);  // SiLU
++        attr.set_post_ops(po);
++    } else if (postop == 2) {
++        state->binary_md = dnnl::memory::desc({m, n}, dst_dt, dnnl::memory::format_tag::ab);
++        dnnl::post_ops po;
++        po.append_binary(dnnl::algorithm::binary_mul, state->binary_md);
++        attr.set_post_ops(po);
++    }
+ 
+     dnnl::matmul::primitive_desc pd = has_bias
+         ? dnnl::matmul::primitive_desc(engine, state->src_md, state->wei_md, state->bias_md, state->dst_md, attr)
+@@ -516,7 +533,9 @@
+     torch::Tensor weight_scale,
+     std::optional<torch::Tensor> bias,
+     int64_t out_dtype_code,
+-    std::optional<torch::Tensor> output_opt
++    std::optional<torch::Tensor> output_opt,
++    int postop = 0,
++    std::optional<torch::Tensor> binary = std::nullopt
+ ) {
+     TORCH_CHECK(x_int8.dim() >= 1,
+         "x_int8 must have at least one dimension");
+@@ -601,7 +620,7 @@
+     sycl::queue& queue = omni_xpu::utils::get_queue(x_int8.device());
+     auto state = get_or_create_int8_scaled_primitive(
+         m, k, n, static_cast<int>(out_dtype_code), has_bias,
+-        w_scale_is_scalar, x_int8.device(), queue);
++        w_scale_is_scalar, x_int8.device(), queue, postop);
+     if (!output_opt.has_value()) {
+         // Preserve the established allocation order for every existing
+         // caller.  Only the explicit out variant supplies storage earlier.
+@@ -628,6 +647,15 @@
+             DNNL_ARG_BIAS,
+             dnnl::memory(state->bias_md, state->engine, bias_f32.data_ptr()));
+     }
++    if (postop == 2) {
++        TORCH_CHECK(binary.has_value(), "binary_mul post-op needs a tensor");
++        TORCH_CHECK(binary->scalar_type() == out_dtype && binary->is_contiguous() &&
++                    binary->numel() == m * n && binary->device() == x_int8.device(),
++                    "binary post-op tensor must be a contiguous [M, N] tensor of the output dtype on the same device");
++        args.emplace(
++            DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1,
++            dnnl::memory(state->binary_md, state->engine, binary->data_ptr()));
++    }
+     state->primitive.execute(stream, args);
+ 
+     return output.reshape(out_sizes);
+@@ -653,6 +681,21 @@
+         std::nullopt);
+ }
+ 
++torch::Tensor int8_linear_prequantized_postop(
++    torch::Tensor x_int8,
++    torch::Tensor x_scale,
++    torch::Tensor weight,
++    torch::Tensor weight_scale,
++    int64_t out_dtype_code,
++    int64_t postop,
++    std::optional<torch::Tensor> binary
++) {
++    TORCH_CHECK(postop == 1 || postop == 2, "postop must be 1 (swish) or 2 (binary_mul)");
++    return int8_linear_prequantized_impl(
++        x_int8, x_scale, weight, weight_scale, std::nullopt, out_dtype_code,
++        std::nullopt, static_cast<int>(postop), binary);
++}
++
+ torch::Tensor int8_linear_prequantized_out(
+     torch::Tensor x_int8,
+     torch::Tensor x_scale,
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/cute/cute_fmha_torch.cpp b/omni_xpu_kernel/omni_xpu_kernel/cute/cute_fmha_torch.cpp
+--- a/omni_xpu_kernel/omni_xpu_kernel/cute/cute_fmha_torch.cpp	2026-08-10 01:09:07.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/cute/cute_fmha_torch.cpp	2026-09-07 03:12:42.260984588 +0000
+@@ -15,6 +15,10 @@
+  *
+  * Launch glue pattern copied from sgl-kernel-xpu src/sycl/comm/common.h.
+  **************************************************************************************************/
++// phase-3c: lazy online-softmax rescale on by default for BMG (bitwise identical, -1.9% on H3 DiT).
++#if defined(OMNI_XPU_ARCH_BMG) && !defined(CUTE_FMHA_LAZY_RESCALE)
++#define CUTE_FMHA_LAZY_RESCALE 1
++#endif
+ #include <ATen/ATen.h>
+ #include <c10/xpu/XPUStream.h>
+ #include <torch/all.h>
+@@ -106,7 +110,10 @@
+     int SubgroupLayoutQOverride = 0,
+     int MmaKOverride = 0,
+     int VTileOverride = 0,
+-    int HeadDimOverride = 0>
++    int HeadDimOverride = 0,
++    int KvTileOverride = 0,
++    bool StaticHeadDim = false,   // phase-3b: Int<HeadDim> in the tensor shapes
++    int SubgroupLayoutNOverride = 0>  // phase-8: subgroups along KV
+ struct D128TileKernel {
+   using PlatformConfig = cute_fmha_config::ActiveConfig;
+   static constexpr int QTile =
+@@ -126,18 +133,28 @@
+   // <TileQ, TileV, KVtile> — so ShapePV's K-dim (3rd) MUST equal 64, not 32.
+   // TileV=32 -> VTiles = 128/32 = 4. (My earlier <256,32,32> broke the QK->PV
+   // K-dim match and tripped the gemm.hpp static_assert.)
+-  static constexpr int KvTile = 64;
++  static constexpr int KvTileDefault = 64;
+ #else
+-  static constexpr int KvTile = PlatformConfig::KV_TILE;
++  static constexpr int KvTileDefault = PlatformConfig::KV_TILE;
+ #endif
++  // Per-route override (B70: KV64 loses 8% on the DiT d128 route but wins 18%
++  // together with 3 stages on the VAE d64 route).
++  static constexpr int KvTile =
++      KvTileOverride > 0 ? KvTileOverride : KvTileDefault;
+   using ShapeQK = Shape<
+       Int<QTile>, Int<KvTile>, Int<MmaK>>;
+   using ShapePV = Shape<
+       Int<QTile>, Int<VTile>, Int<KvTile>>;
+   using ShapeOutput = Shape<
+       Int<QTile>, Int<HeadDim>>;
++  // phase-8: <Q, KV, 1>. An N > 1 splits the KV tile between subgroups, which turns into a
++  // split of the P*V contraction (get_sg_layout_pv) and is reduced in the epilogue (ReduceK).
++  static constexpr int SubgroupLayoutN =
++      SubgroupLayoutNOverride > 0 ? SubgroupLayoutNOverride : 1;
+   using SubgroupLayoutQK = Layout<
+-      Shape<Int<SubgroupLayoutQ>, _1, _1>>;
++      Shape<Int<SubgroupLayoutQ>, Int<SubgroupLayoutN>, _1>>;
++  static_assert(SubgroupLayoutQ * SubgroupLayoutN * 16 <= 512,
++                "cute_fmha: workgroup exceeds 512 work-items at 256 GRF");
+ #ifdef CUTE_FMHA_STAGES
+   static constexpr int PipelineStages = CUTE_FMHA_STAGES;
+ #else
+@@ -145,7 +162,11 @@
+       PipelineStagesOverride > 0 ? PipelineStagesOverride
+                                  : PlatformConfig::PIPELINE_STAGES;
+ #endif
++#ifdef CUTE_FMHA_GRF
++  static constexpr int GrfSize = CUTE_FMHA_GRF;   // phase-3a variant sweep
++#else
+   static constexpr int GrfSize = PlatformConfig::GRF_SIZE;
++#endif
+ 
+   using ElementQ = Element;
+   using ElementK = Element;
+@@ -153,7 +174,14 @@
+   using ElementO = Element;   // output dtype == input dtype (fp16/bf16)
+ 
+   using StrideQ = Stride<int, _1, int, int>;
++#if defined(CUTE_FMHA_DIAG_K_AS_V) && CUTE_FMHA_DIAG_K_AS_V
++  /* phase-5 timing probe: pretend K's sequence mode is the contiguous one, the way V's is, so
++     make_block_2d_copy_B emits the VNNI load (d16v) instead of the transposing load (d32t).
++     The kernel then reads the wrong elements — use only to price a pre-transposed K. */
++  using StrideK = Stride<_1, int, int, int>;
++#else
+   using StrideK = Stride<int, _1, int, int>;
++#endif
+   using StrideV = Stride<_1, int, int, int>;
+   using StrideO = Stride<int, _1, int, int>;
+ 
+@@ -172,14 +200,19 @@
+   static auto make_dummy(Element v, StrideQ s) {
+     return make_tensor(make_gmem_ptr(&v), make_layout(repeat<rank_v<StrideQ>>(1), s));
+   }
++  // phase-3b: with StaticHeadDim the head-dim mode is Int<HeadDim>, so every
++  // head-dim chunk loop in the mainloop has a static trip count.
++  using HD = std::conditional_t<StaticHeadDim, Int<HeadDim>, int>;
++  using ShapeQKO = Shape<int, HD, int, int>;
++  using ShapeVT  = Shape<HD, int, int, int>;
+   using TensorQ = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+-                            make_layout(repeat<rank_v<StrideQ>>(1), StrideQ{})));
++                            make_layout(ShapeQKO{}, StrideQ{})));
+   using TensorK = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+-                            make_layout(repeat<rank_v<StrideK>>(1), StrideK{})));
++                            make_layout(ShapeQKO{}, StrideK{})));
+   using TensorV = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+-                            make_layout(repeat<rank_v<StrideV>>(1), StrideV{})));
++                            make_layout(ShapeVT{}, StrideV{})));
+   using TensorO = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+-                            make_layout(repeat<rank_v<StrideO>>(1), StrideO{})));
++                            make_layout(ShapeQKO{}, StrideO{})));
+   using TensorK_cache = TensorK;
+   using TensorV_cache = TensorV;
+ 
+@@ -206,7 +239,10 @@
+     int SubgroupLayoutQOverride = 0,
+     int MmaKOverride = 0,
+     int VTileOverride = 0,
+-    int HeadDimOverride = 0>
++    int HeadDimOverride = 0,
++    int KvTileOverride = 0,
++    bool StaticHeadDim = false,
++    int SubgroupLayoutNOverride = 0>
+ void run_d128_tile(
+     const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
+     int B, int H, int Lq, int Lkv, int D, float scale,
+@@ -223,14 +259,23 @@
+       SubgroupLayoutQOverride,
+       MmaKOverride,
+       VTileOverride,
+-      HeadDimOverride>;
++      HeadDimOverride,
++      KvTileOverride,
++      StaticHeadDim,
++      SubgroupLayoutNOverride>;
+   using K    = typename KT::Kernel;
++  if constexpr (StaticHeadDim) {
++    TORCH_CHECK(D == KT::HeadDim, "cute_fmha: static head-dim route requires D == ", KT::HeadDim);
++  }
+   using PS   = typename KT::ProblemShapeType;
+ 
+   cutlass::KernelHardwareInfo hw_info;
+-  hw_info.sm_count =
++  // Queried once: two get_info calls per attention call otherwise, and the
++  // individual tile scheduler ignores sm_count anyway.
++  static const int cached_sm_count =
+       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+           hw_info.device_id);
++  hw_info.sm_count = cached_sm_count;
+ 
+   PS shape;
+   shape.batch = B;
+@@ -268,11 +313,19 @@
+           checked_int(q_stride_seq, "Q sequence stride"), _1{},
+           checked_int(q_stride_head, "Q head stride"),
+           checked_int(q_stride_batch, "Q batch stride"));
++#if defined(CUTE_FMHA_DIAG_K_AS_V) && CUTE_FMHA_DIAG_K_AS_V
++  typename KT::StrideK stride_K =
++      cute::make_stride(
++          _1{}, checked_int(k_stride_seq, "K sequence stride"),
++          checked_int(k_stride_head, "K head stride"),
++          checked_int(k_stride_batch, "K batch stride"));
++#else
+   typename KT::StrideK stride_K =
+       cute::make_stride(
+           checked_int(k_stride_seq, "K sequence stride"), _1{},
+           checked_int(k_stride_head, "K head stride"),
+           checked_int(k_stride_batch, "K batch stride"));
++#endif
+   typename KT::StrideV stride_V =
+       cute::make_stride(
+           _1{}, checked_int(v_stride_seq, "V sequence stride"),
+@@ -299,13 +352,17 @@
+       hw_info};
+ 
+   size_t workspace_size = K::get_workspace_size(arguments);
+-  auto opts = at::TensorOptions().dtype(at::kByte).device(at::kXPU);
+-  at::Tensor workspace = at::empty({(long)workspace_size}, opts);
++  at::Tensor workspace;
++  if (workspace_size > 0) {
++    auto opts = at::TensorOptions().dtype(at::kByte).device(at::kXPU);
++    workspace = at::empty({(long)workspace_size}, opts);
++  }
+ 
+   TORCH_CHECK(K::can_implement(arguments),
+               "cute_fmha: can_implement failed (bad problem shape)");
+-  K::initialize_workspace(arguments, workspace.data_ptr());
+-  auto kernel_params = K::to_underlying_arguments(arguments, workspace.data_ptr());
++  void* workspace_ptr = workspace.defined() ? workspace.data_ptr() : nullptr;
++  K::initialize_workspace(arguments, workspace_ptr);
++  auto kernel_params = K::to_underlying_arguments(arguments, workspace_ptr);
+   launch_on_torch_queue<K, KT::GrfSize>(kernel_params);
+ }
+ 
+@@ -518,7 +575,33 @@
+         output.stride(2), output.stride(1), output.stride(0));
+   } else if (q.scalar_type() == at::kBFloat16) {
+     if (use_minimax_h3_h56_mmak16(q, k, v, B, H, Lq, Lkv, D)) {
+-      run_d128_tile<cutlass::bfloat16_t, 0, 0, 0, 16>(
++#ifndef CUTE_FMHA_DIT_STAGES
++#define CUTE_FMHA_DIT_STAGES 0
++#endif
++#ifndef CUTE_FMHA_DIT_QTILE
++#define CUTE_FMHA_DIT_QTILE 0
++#endif
++#ifndef CUTE_FMHA_DIT_SG
++#define CUTE_FMHA_DIT_SG 0
++#endif
++#ifndef CUTE_FMHA_DIT_MMAK
++#define CUTE_FMHA_DIT_MMAK 16
++#endif
++#ifndef CUTE_FMHA_DIT_VTILE
++#define CUTE_FMHA_DIT_VTILE 0
++#endif
++#ifndef CUTE_FMHA_DIT_KV
++#define CUTE_FMHA_DIT_KV 0
++#endif
++#ifndef CUTE_FMHA_DIT_STATIC_HD
++#define CUTE_FMHA_DIT_STATIC_HD 0
++#endif
++#ifndef CUTE_FMHA_DIT_SGN
++#define CUTE_FMHA_DIT_SGN 0
++#endif
++      run_d128_tile<cutlass::bfloat16_t, CUTE_FMHA_DIT_STAGES, CUTE_FMHA_DIT_QTILE,
++                    CUTE_FMHA_DIT_SG, CUTE_FMHA_DIT_MMAK, CUTE_FMHA_DIT_VTILE, 0,
++                    CUTE_FMHA_DIT_KV, (CUTE_FMHA_DIT_STATIC_HD != 0), CUTE_FMHA_DIT_SGN>(
+           q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
+           B, H, Lq, Lkv, D, scale,
+           q.stride(2), q.stride(1), q.stride(0),
+@@ -576,7 +659,21 @@
+   at::Tensor output =
+       at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
+   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+-  run_d128_tile<cutlass::half_t, 0, 0, 0, 0, 0, 64>(
++  // -DCUTE_FMHA_VAE_QTILE=128|64 shrinks the Q tile for the short VAE tiles
++  // (L~1797: 256-row tiles leave the last tile 2% utilised); subgroup layout
++  // scales with it to keep 16 rows per subgroup.
++#ifndef CUTE_FMHA_VAE_QTILE
++#define CUTE_FMHA_VAE_QTILE 0
++#endif
++#ifndef CUTE_FMHA_VAE_STAGES
++#define CUTE_FMHA_VAE_STAGES 0
++#endif
++#ifndef CUTE_FMHA_VAE_KV
++#define CUTE_FMHA_VAE_KV 0
++#endif
++  run_d128_tile<cutlass::half_t, CUTE_FMHA_VAE_STAGES, CUTE_FMHA_VAE_QTILE,
++                (CUTE_FMHA_VAE_QTILE > 0 ? CUTE_FMHA_VAE_QTILE / 16 : 0),
++                0, 0, 64, CUTE_FMHA_VAE_KV>(
+       q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L, L,
+       D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+       k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/int8/__init__.py b/omni_xpu_kernel/omni_xpu_kernel/int8/__init__.py
+--- a/omni_xpu_kernel/omni_xpu_kernel/int8/__init__.py	2026-08-07 00:52:57.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/int8/__init__.py	2026-09-06 13:51:43.810605370 +0000
+@@ -100,6 +100,38 @@
+ _H3_FFN_DOWN_FEATURES = 5376
+ _H3_ATTN_OUTPUT_INPUT_FEATURES = 7168
+ _H3_ATTN_OUTPUT_FEATURES = 5376
++# Phase-1 (2026-09-05): fused in-register ConvRot+quantize for activations.
++# OMNIXPU_CONVROT_FUSED=0 restores the matmul-Hadamard + separate quantize path.
++# Default off (2026-09-05): gain is below noise and the 1-LSB quantization differences
++# change the 6-step turbo sample (seed-102 PSNR 19.5 dB). OMNIXPU_CONVROT_FUSED=1 opts in.
++_CONVROT_FUSED = os.environ.get("OMNIXPU_CONVROT_FUSED", "1") != "0"  # phase-2d kernel: default on
++_CONVROT_FUSED_MIN_K = int(os.environ.get("OMNIXPU_CONVROT_FUSED_MIN_K", "0"))
++# Row-split variant (0 = Intel one-row-per-work-item kernel).
++_CONVROT_SPLIT = int(os.environ.get("OMNIXPU_CONVROT_SPLIT", "16"))
++
++
++def _quantize_convrot_fused(x, native, convrot_groupsize):
++    if _CONVROT_SPLIT > 0 and hasattr(native, "quantize_int8_convrot_fused_split"):
++        return native.quantize_int8_convrot_fused_split(x, convrot_groupsize, _CONVROT_SPLIT)
++    return _quantize_convrot_fused(x, native, convrot_groupsize)
++
++
++def _can_quantize_convrot_fused(x, native, convrot_groupsize):
++    return bool(
++        _CONVROT_FUSED
++        and native is not None
++        and hasattr(native, "quantize_int8_convrot_fused")
++        and convrot_groupsize in (64, 256)
++        and x.dim() == 2
++        and x.dtype in (torch.bfloat16, torch.float16)
++        and x.is_contiguous()
++        and x.shape[1] % convrot_groupsize == 0
++        # B70 measured (2026-09-05): the one-row-per-work-item fused kernel runs at
++        # ~205 GB/s vs ~500 GB/s for matmul-rotate + separate quantize, so it only
++        # wins where the separate quantize has no tuned BMG config (K=14336 fc2:
++        # 3.41 ms vs 1.90+2.29). OMNIXPU_CONVROT_FUSED_MIN_K overrides.
++        and x.shape[1] >= _CONVROT_FUSED_MIN_K
++    )
+ 
+ 
+ def _is_supported_h3_swiglu_target() -> bool:
+@@ -228,10 +260,21 @@
+     for start in range(0, rows, chunk_rows):
+         stop = min(start + chunk_rows, rows)
+         chunk = x[start:stop]
++        if _CONVROT_FUSED and _CONVROT_SPLIT > 0 and hasattr(native, "quantize_int8_convrot_silu_mul_split"):
++            gate = up = activated = rotated = None
++            x_int8, x_scale = native.quantize_int8_convrot_silu_mul_split(chunk, 256, _CONVROT_SPLIT)
++            output_chunk = output[start:stop]
++            native.int8_linear_prequantized_out(x_int8, x_scale, weight, weight_scale, None, dtype_code, output_chunk)
++            del output_chunk, x_scale, x_int8, chunk
++            continue
+         gate, up = chunk.chunk(2, dim=-1)
+         activated = native.fused_silu_mul_exact_bf16(gate, up)
+-        rotated = native.rotate_convrot(activated, 256)
+-        x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
++        if _can_quantize_convrot_fused(activated, native, 256):
++            rotated = None
++            x_int8, x_scale = _quantize_convrot_fused(activated, native, 256)
++        else:
++            rotated = native.rotate_convrot(activated, 256)
++            x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
+         output_chunk = output[start:stop]
+         native.int8_linear_prequantized_out(
+             x_int8,
+@@ -328,8 +371,12 @@
+     for start in range(0, rows, chunk_rows):
+         stop = min(start + chunk_rows, rows)
+         chunk = x[start:stop]
+-        rotated = native.rotate_convrot(chunk, 256)
+-        x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
++        if _can_quantize_convrot_fused(chunk, native, 256):
++            rotated = None
++            x_int8, x_scale = _quantize_convrot_fused(chunk, native, 256)
++        else:
++            rotated = native.rotate_convrot(chunk, 256)
++            x_int8, x_scale = native.quantize_int8_rowwise_fused(rotated)
+         output_chunk = output[start:stop]
+         native.int8_linear_prequantized_out(
+             x_int8,
+@@ -969,6 +1016,18 @@
+             convrot_groupsize,
+             input_act,
+         ):
++            if (
++                _CONVROT_FUSED and _CONVROT_SPLIT > 0
++                and hasattr(native, "quantize_int8_convrot_silu_mul_split")
++                and bias is None
++            ):
++                # fc2 producer fusion: SiLU*mul + rotate + quantize in one pass
++                x_int8, x_scale = native.quantize_int8_convrot_silu_mul_split(
++                    x, convrot_groupsize, _CONVROT_SPLIT
++                )
++                return native.int8_linear_prequantized(
++                    x_int8, x_scale, weight, weight_scale, bias, dtype_code
++                )
+             x = _apply_h3_swiglu_exact(x, native)
+         else:
+             x = _apply_input_act(x, input_act)
+@@ -1034,6 +1093,11 @@
+                     f"ConvRot group size {convrot_groupsize} does not divide "
+                     f"input features {x.shape[-1]}"
+                 )
++            if _can_quantize_convrot_fused(x, native, convrot_groupsize):
++                x_int8, x_scale = _quantize_convrot_fused(x, native, convrot_groupsize)
++                return native.int8_linear_prequantized(
++                    x_int8, x_scale, weight, weight_scale, bias, dtype_code
++                )
+             if hasattr(native, "rotate_convrot"):
+                 x = native.rotate_convrot(x, convrot_groupsize)
+             else:
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/omni_xpu_kernel/norm/__init__.py b/omni_xpu_kernel/omni_xpu_kernel/norm/__init__.py
+--- a/omni_xpu_kernel/omni_xpu_kernel/norm/__init__.py	2026-08-10 01:09:07.000000000 +0000
++++ b/omni_xpu_kernel/omni_xpu_kernel/norm/__init__.py	2026-09-06 13:11:21.869162636 +0000
+@@ -80,6 +80,11 @@
+     return _get_native().rms_norm(weight, input, eps)
+ 
+ 
++def rms_norm_mod(weight, input, scale, shift, seg_end, seg_mod, eps=1e-6):
++    """RMSNorm with fused AdaLN scale/shift (see native docstring)."""
++    return _get_native().rms_norm_mod(weight, input, scale, shift, seg_end, seg_mod, eps)
++
++
+ def rms_norm_gate_residual(
+     weight: torch.Tensor,
+     input: torch.Tensor,
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist -x .pytest_cache a/omni_xpu_kernel/setup.py b/omni_xpu_kernel/setup.py
+--- a/omni_xpu_kernel/setup.py	2026-08-10 01:10:35.000000000 +0000
++++ b/omni_xpu_kernel/setup.py	2026-10-09 09:51:11.822144930 +0000
+@@ -30,7 +30,7 @@
+ from setuptools.command.build_ext import build_ext
+ 
+ IS_WINDOWS = platform.system() == "Windows"
+-VALIDATED_ONEDNN_VERSION = (3, 9, 1)
++VALIDATED_ONEDNN_VERSION = tuple(int(x) for x in os.environ.get("OMNI_ONEDNN_VERSION", "3.9.1").split("."))
+ 
+ 
+ VERSION_NAMESPACE = run_path(str(Path(__file__).parent / "omni_xpu_kernel" / "_version.py"))
+@@ -45,6 +45,12 @@
+ }
+ XPU_ARCH_MACRO = XPU_ARCH_MACROS[BUILD_XPU_TARGET]
+ 
++# ocloc target for AOT codegen. BUILD_XPU_TARGET names the *family* (and picks the arch macro,
++# the include overlay and the wheel tag); the alias "bmg" resolves to bmg-g21 (B580, IP 20.1.0).
++# Set OMNI_XPU_OCLOC_DEVICE to compile for a specific die, e.g. bmg-g31 for Arc Pro B70 (IP 20.2.0).
++# `ocloc ids <name>` prints the IP version; `ocloc compile -device 0x<pciid>` prints the match.
++AOT_OCLOC_DEVICE = os.environ.get("OMNI_XPU_OCLOC_DEVICE", "").strip() or BUILD_XPU_TARGET
++
+ BMG_CUTE_REMAINDER_MASK_ORIGINAL = """\
+           FragSRow k_rem_mask;
+           int k_val = get<0>(tKgK_cur(0,0,0,k_idx,0)) + kblocks_cache * get<1>(TileShapeQK{});
+@@ -85,7 +91,7 @@
+     return [
+         "-fsycl-targets=spir64_gen",
+         "-Xsycl-target-backend",
+-        f"-device {xpu_target}",
++        f"-device {AOT_OCLOC_DEVICE}",
+         "-DOMNI_XPU_CORE_AOT=1",
+     ]
+ 
+@@ -378,7 +384,7 @@
+                 f"expected {expected} to match onednn==2025.3.0"
+             )
+         library_version = get_onednn_library_version(runtime_library)
+-        if library_version is not None and library_version != header_version:
++        if library_version is not None and library_version[:2] != header_version[:2]:
+             header_text = ".".join(map(str, header_version))
+             library_text = ".".join(map(str, library_version))
+             raise RuntimeError(
+@@ -487,8 +493,74 @@
+     return ["-Wl,--disable-new-dtags,-rpath," + ":".join(rpaths)]
+ 
+ 
++
++def _omni_parallel_build(cmd, sources, output_path, objdir, jobs, split, env, is_single):
++    """Split `icpx ... -shared -o out SRCS` into parallel `-c` compiles + one link.
++
++    Returns None when the whole build was done here, or a (possibly modified)
++    single-invocation cmd when there is only one source (nothing to split).
++    """
++    import subprocess
++    from concurrent.futures import ThreadPoolExecutor
++    link_extra = [f"-fsycl-max-parallel-link-jobs={jobs}"]
++    if split:
++        link_extra.append(f"-fsycl-device-code-split={split}")
++    src_set = {str(s) for s in sources}
++    if is_single or len(sources) < 2:
++        # single-source extensions: only add the parallel link/AOT flags
++        return cmd[:1] + link_extra + cmd[1:]
++
++    def is_link_only(tok, prev):
++        return (tok in ("-shared",) or tok.startswith("-L") or tok.startswith("-l")
++                or tok.startswith("-Wl,") or tok.endswith(".so") or tok.endswith(".a")
++                or tok in src_set or tok == str(output_path) or prev == "-o" or tok == "-o")
++
++    compile_base = []
++    prev = None
++    for tok in cmd:
++        if not is_link_only(tok, prev):
++            compile_base.append(tok)
++        prev = tok
++    objdir.mkdir(parents=True, exist_ok=True)
++
++    def compile_one(src):
++        obj = objdir / (Path(src).stem + ".o")
++        c = compile_base + ["-c", str(src), "-o", str(obj)]
++        r = subprocess.run(c, capture_output=True, text=True, encoding="utf-8",
++                           errors="replace", env=env)
++        return src, obj, r
++
++    print(f"[parallel] compiling {len(sources)} sources with {jobs} jobs")
++    objs = []
++    with ThreadPoolExecutor(max_workers=jobs) as ex:
++        for src, obj, r in ex.map(compile_one, sources):
++            if r.returncode != 0:
++                print("STDOUT:", r.stdout); print("STDERR:", r.stderr)
++                raise RuntimeError(f"Compilation failed for {src}")
++            objs.append(str(obj))
++
++    # link: original cmd with sources swapped for objects
++    link = [tok for tok in cmd if tok not in src_set]
++    link = link[:1] + link_extra + link[1:] + objs
++    print(f"[parallel] link: {' '.join(link)}")
++    r = subprocess.run(link, capture_output=True, text=True, encoding="utf-8",
++                       errors="replace", env=env)
++    if r.returncode != 0:
++        print("STDOUT:", r.stdout); print("STDERR:", r.stderr)
++        raise RuntimeError(f"Link failed with exit code {r.returncode}")
++    return None
++
++
+ class ICPXBuildExt(build_ext):
+     """Build extension using Intel icpx compiler directly."""
++
++    def finalize_options(self):
++        super().finalize_options()
++        jobs = int(os.environ.get("OMNI_BUILD_JOBS", "1") or "1")
++        if jobs > 1:
++            # setuptools' build_ext runs build_extension() for each extension
++            # in a thread pool when .parallel is set.
++            self.parallel = jobs
+     
+     def build_extension(self, ext):
+         # Find compiler
+@@ -588,7 +660,7 @@
+             if is_lgrf:
+                 cmd += [
+                     "-fsycl-targets=spir64_gen",
+-                    "-Xs", f"-device {BUILD_XPU_TARGET} -options -doubleGRF",
++                    "-Xs", f"-device {AOT_OCLOC_DEVICE} -options -doubleGRF",
+                     "/O2", "/DNDEBUG",
+                     "/EHsc",
+                     "/std:c++17",
+@@ -606,7 +678,7 @@
+                 cmd += [
+                     "-fsycl-targets=spir64_gen",
+                     "-Xsycl-target-backend",
+-                    f"-device {BUILD_XPU_TARGET}",
++                    f"-device {AOT_OCLOC_DEVICE}",
+                     "-fsycl-esimd-force-stateless-mem",
+                     "/O2", "/DNDEBUG",
+                     f"/D{XPU_ARCH_MACRO}=1",
+@@ -648,7 +720,7 @@
+             if is_lgrf:
+                 cmd += [
+                     "-fsycl-targets=spir64_gen",
+-                    "-Xs", f"-device {BUILD_XPU_TARGET} -options -doubleGRF",
++                    "-Xs", f"-device {AOT_OCLOC_DEVICE} -options -doubleGRF",
+                     "-O3", "-DNDEBUG",
+                     "-DBUILD_ESIMD_KERNEL_LIB",
+                     f"-D{XPU_ARCH_MACRO}=1",
+@@ -675,14 +747,20 @@
+                     )
+                     cute_overlay_flags.append(f"-I{overlay}")
+                 cmd += [
+-                    "-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-shared",
++                    "-std=" + os.environ.get("OMNI_CXX_STD", "c++17"), "-O3", "-DNDEBUG", "-fPIC", "-shared",
+                     "-fsycl-targets=spir64_gen",
+-                    "-Xsycl-target-backend", f"-device {BUILD_XPU_TARGET}",
++                    "-Xsycl-target-backend", f"-device {AOT_OCLOC_DEVICE}",
+                     "-Xspirv-translator",
+                     "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,"
+                     "+SPV_INTEL_subgroup_matrix_multiply_accumulate",
+                     "-fno-sycl-instrument-device-code",
+                     "-DCUTLASS_ENABLE_SYCL", "-DSYCL_INTEL_TARGET",
++                    *os.environ.get("OMNI_CUTE_EXTRA_FLAGS", "").split(),
++                    # B70 (2026-09-05): the MiniMax H3 VAE d64 route is 16% faster
++                    # with a 64-wide KV tile and 3 pipeline stages; the DiT d128
++                    # route keeps the shipped KV32/2-stage config (KV64 lost 8%).
++                    *(["-DCUTE_FMHA_VAE_KV=64", "-DCUTE_FMHA_VAE_STAGES=3"]
++                      if BUILD_XPU_TARGET == "bmg" else []),
+                     f"-D{XPU_ARCH_MACRO}=1",
+                     f"-D_GLIBCXX_USE_CXX11_ABI={torch_cxx11_abi}",
+                     *cute_overlay_flags,
+@@ -716,7 +794,7 @@
+                     "-O3", "-DNDEBUG",
+                     f"-D{XPU_ARCH_MACRO}=1",
+                     "-fPIC", "-shared",
+-                    "-std=c++17",
++                    "-std=" + os.environ.get("OMNI_CXX_STD", "c++17"),
+                 ]
+                 # torch/include contains another oneDNN header tree. Put the
+                 # explicitly selected installation first so it matches -ldnnl.
+@@ -751,6 +829,17 @@
+                     ext.name, torch_runtime_lib, runtime_lib, onednn_lib
+                 )
+         
++        jobs = int(os.environ.get("OMNI_BUILD_JOBS", "1") or "1")
++        split = os.environ.get("OMNI_BUILD_DEVICE_SPLIT", "")
++        if not IS_WINDOWS and jobs > 1:
++            cmd = _omni_parallel_build(
++                cmd, sources, output_path, Path(self.build_temp) / "objs" / ext.name,
++                jobs, split, get_compile_env(onednn_include if has_onednn else ""),
++                is_single=(is_lgrf or is_cute),
++            )
++            if cmd is None:
++                print(f"Successfully built {output_path} (parallel)")
++                return
+         print(f"Compile command: {' '.join(cmd)}")
+         
+         # Run compiler
+@@ -887,7 +976,7 @@
+     python_requires=">=3.9",
+     install_requires=[
+         f"torch=={BUILD_TORCH_VERSION}",
+-        "onednn==2025.3.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
++        "onednn==" + os.environ.get("OMNI_ONEDNN_PIP_VERSION", "2025.3.0") + "; platform_system == 'Linux' and platform_machine == 'x86_64'",
+     ],
+     extras_require={
+         "dev": [

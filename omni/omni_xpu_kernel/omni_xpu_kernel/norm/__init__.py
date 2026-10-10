@@ -1,0 +1,227 @@
+"""
+Normalization Kernels
+
+High-performance RMSNorm and LayerNorm using Intel ESIMD.
+
+Example:
+    import torch
+    from omni_xpu_kernel import norm
+
+    # RMSNorm
+    output = norm.rms_norm(weight, input, eps=1e-6)
+
+    # LayerNorm
+    output = norm.layer_norm(input, weight, bias, eps=1e-5)
+"""
+
+import torch
+from typing import Optional
+
+
+def _get_native():
+    """Get the native norm module."""
+    from .. import _load_extension
+
+    return _load_extension().norm
+
+
+def supports_h120_fp16() -> bool:
+    """Return whether the loaded native binary contains the H120 FP16 route."""
+    return bool(getattr(_get_native(), "__h120_fp16__", False))
+
+
+def supports_group_norm_bmg() -> bool:
+    """Return whether the loaded native binary contains the BMG GroupNorm route."""
+    return bool(getattr(_get_native(), "__group_norm_bmg__", False))
+
+
+def group_norm_bmg(
+    input: torch.Tensor,
+    num_groups: int,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Run the validated BMG Boogu Image Turbo GroupNorm contracts.
+
+    The native entry point accepts contiguous BF16 XPU tensors for the six
+    captured ``[1,C,H,W]`` shapes, 32 groups, affine BF16 parameters, and
+    ``eps=1e-6``. Callers must retain their normal fallback for other inputs.
+    """
+    return _get_native().group_norm_bmg(
+        input, num_groups, weight, bias, eps
+    )
+
+
+def rms_norm(
+    weight: torch.Tensor, input: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    RMSNorm (Root Mean Square Normalization) using ESIMD optimization.
+
+    RMSNorm normalizes input by the RMS of the elements:
+        output = (input / sqrt(mean(input^2) + eps)) * weight
+
+    Args:
+        weight: Weight tensor of shape [hidden_size]
+        input: Input tensor of shape [batch_size, hidden_size]
+        eps: Small constant for numerical stability
+
+    Returns:
+        Normalized tensor of same shape as input
+
+    Note:
+        - Input must be 2D tensor [batch_size, hidden_size]
+        - hidden_size must be <= 8192 and divisible by 32, except that a
+          validated PTL-H or BMG binary may additionally advertise native
+          FP16 H120 support
+        - Supports fp32, fp16, bf16
+    """
+    return _get_native().rms_norm(weight, input, eps)
+
+
+def rms_norm_mod(weight, input, scale, shift, seg_end, seg_mod, eps=1e-6):
+    """RMSNorm with fused AdaLN scale/shift (see native docstring)."""
+    return _get_native().rms_norm_mod(weight, input, scale, shift, seg_end, seg_mod, eps)
+
+
+def rms_norm_gate_residual(
+    weight: torch.Tensor,
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fuse the validated PTL-H Z-Image RMSNorm/gate/residual chain.
+
+    Equivalent to ``residual + gate * rms_norm(weight, input, eps)`` with
+    BF16 materialization after RMSNorm and after the gate multiply. The native
+    route accepts contiguous BF16 ``input``/``residual`` tensors shaped
+    ``[M, 3840]`` for M=64, 1024, or 1088, plus 1D weight/gate tensors.
+    """
+    native = _get_native()
+    if not hasattr(native, "rms_norm_gate_residual"):
+        raise RuntimeError(
+            "rms_norm_gate_residual is only available in a PTL-H native build"
+        )
+    return native.rms_norm_gate_residual(
+        weight, input, gate, residual, eps
+    )
+
+
+def layer_norm(
+    input: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """
+    LayerNorm using ESIMD optimization.
+
+    LayerNorm normalizes input by mean and variance:
+        output = ((input - mean) / sqrt(var + eps)) * weight + bias
+
+    Args:
+        input: Input tensor of shape [batch_size, hidden_size]
+        weight: Optional weight tensor of shape [hidden_size]
+        bias: Optional bias tensor of shape [hidden_size]
+        eps: Small constant for numerical stability
+
+    Returns:
+        Normalized tensor of same shape as input
+
+    Note:
+        - Input must be 2D tensor [batch_size, hidden_size]
+        - hidden_size must be <= 8192 and divisible by 32
+        - Supports fp32, fp16, bf16
+    """
+    return _get_native().layer_norm(input.contiguous(), weight, bias, eps)
+
+
+def fused_add_rms_norm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> None:
+    """
+    Fused Add + RMSNorm using ESIMD optimization (in-place).
+
+    Performs in-place:
+        residual += input
+        input = rmsnorm(residual) * weight
+
+    This fuses the residual addition and RMSNorm into a single kernel,
+    reducing memory bandwidth by avoiding an extra read/write pass.
+
+    Args:
+        input: Input tensor of shape [batch_size, hidden_size]. Modified in-place
+               to contain the normalized output.
+        residual: Residual tensor of shape [batch_size, hidden_size]. Modified
+                  in-place to contain residual + original input.
+        weight: Weight tensor of shape [hidden_size].
+        eps: Small constant for numerical stability.
+
+    Note:
+        - Both input and residual are modified in-place
+        - Tensors must be 2D [batch_size, hidden_size]
+        - hidden_size must be <= 8192 and divisible by 32
+        - Supports fp32, fp16, bf16
+    """
+    _get_native().fused_add_rms_norm(input, residual, weight, eps)
+
+
+def fused_rms_norm_linear(
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    proj_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Fused RMSNorm + Linear projection in single C++ call.
+
+    Equivalent to: F.linear(rms_norm(norm_weight, input, eps), proj_weight)
+    But avoids Python roundtrip and keeps normalized data warm in L3 cache.
+
+    Args:
+        input: [M, K] activation tensor
+        norm_weight: [K] RMSNorm weight
+        proj_weight: [N, K] linear projection weight
+        eps: RMSNorm epsilon
+
+    Returns:
+        [M, N] projected output
+    """
+    return _get_native().fused_rms_norm_linear(input, norm_weight, proj_weight, eps)
+
+
+def fused_adaln(
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    row_repeat: int = 1,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fuse LayerNorm and AdaLN modulation into one ESIMD kernel."""
+    return _get_native().fused_adaln(input, scale, shift, row_repeat, eps)
+
+
+def fused_rms_adaln(
+    input: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    row_repeat: int = 1,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fuse RMSNorm and AdaLN modulation into one ESIMD kernel."""
+    return _get_native().fused_rms_adaln(input, scale, shift, row_repeat, eps)
+
+
+__all__ = [
+    "group_norm_bmg",
+    "rms_norm",
+    "rms_norm_gate_residual",
+    "layer_norm",
+    "fused_add_rms_norm",
+    "fused_rms_norm_linear",
+    "fused_adaln",
+    "fused_rms_adaln",
+    "supports_group_norm_bmg",
+]

@@ -1,0 +1,3472 @@
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/__init__.py b/comfy_kitchen/__init__.py
+--- a/comfy_kitchen/__init__.py	2026-10-09 23:24:10.181261438 +0000
++++ b/comfy_kitchen/__init__.py	2026-10-09 05:30:54.498309945 +0000
+@@ -7,6 +7,8 @@
+ from .backends import ascend as _ascend_backend  # noqa: F401
+ from .backends import eager as _eager_backend  # noqa: F401
+ from .backends import triton as _triton_backend  # noqa: F401
++from .backends import xpu as _xpu_backend  # noqa: F401
++from ._version import __version__  # noqa: F401
+ from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
+ from .backends.eager.quantization import DTYPE_TO_CODE
+ from .backends.eager.quantization import mm_int8 as _mm_int8
+@@ -21,6 +23,14 @@
+ from .float_utils import from_blocked, swap_nibbles, to_blocked
+ from .gated_delta import deltanet_conv_step, gated_delta_decode_fused
+ from .gated_delta import is_available as gated_delta_decode_is_available
++from .gguf import dequantize_gguf, get_gguf_route_diagnostics
++from .svdquant_w4a16 import (
++    PreparedSVDQuantW4A16,
++    get_svdquant_w4a16_route_diagnostics,
++    prepare_svdquant_w4a16_for_xpu,
++    restore_svdquant_w4a16_source_,
++    svdquant_w4a16_linear,
++)
+ from .registry import registry
+ from .sage_attention import (
+     PrequantizedInt8Attention,
+@@ -55,6 +65,7 @@
+     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
+ 
+ __all__ = [
++    "__version__",
+     # Normalization
+     "adaln",
+     "fp16_conv3d",
+@@ -89,10 +100,17 @@
+     "quantize_int8_rowwise",
+     "quantize_int8_tensorwise",
+     "dequantize_int8_simple",
++    "dequantize_gguf",
++    "get_gguf_route_diagnostics",
++    "PreparedSVDQuantW4A16",
++    "get_svdquant_w4a16_route_diagnostics",
++    "prepare_svdquant_w4a16_for_xpu",
++    "restore_svdquant_w4a16_source_",
+     # Fused matmul
+     "scaled_mm_nvfp4",
+     "scaled_mm_mxfp8",
+     "scaled_mm_svdquant_w4a4",
++    "svdquant_w4a16_linear",
+     "convrot_w4a4_linear",
+     "dequantize_convrot_w4a4_weight",
+     "dequantize_w4a8_int8_weight",
+@@ -950,7 +968,9 @@
+ 
+ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
+-    return _mm_int8(a, b)
++    kwargs = {"a": a, "b": b}
++    impl = registry.get_implementation("mm_int8", kwargs=kwargs)
++    return impl(**kwargs)
+ 
+ 
+ def fp16_linear(
+@@ -1064,7 +1084,7 @@
+ 
+     Args:
+         priority: List of backend names in order of preference
+-                 Example: ["cuda", "eager"] to prefer CUDA over Torch
++                 Example: ["xpu", "triton", "eager"]
+     """
+     registry.set_priority(priority)
+ 
+@@ -1073,7 +1093,7 @@
+     """Disable a backend, preventing its use.
+ 
+     Args:
+-        name: Backend name to disable ("eager", "cuda", or "triton")
++        name: Backend name to disable ("xpu", "triton", or "eager")
+     """
+     registry.disable(name)
+ 
+@@ -1082,7 +1102,7 @@
+     """Re-enable a previously disabled backend.
+ 
+     Args:
+-        name: Backend name to enable ("eager", "cuda", or "triton")
++        name: Backend name to enable ("xpu", "triton", or "eager")
+     """
+     registry.enable(name)
+ 
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/_version.py b/comfy_kitchen/_version.py
+--- a/comfy_kitchen/_version.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/_version.py	2026-10-09 05:30:54.477946076 +0000
+@@ -0,0 +1,35 @@
++"""Resolve the package version from its build metadata."""
++
++from __future__ import annotations
++
++import re
++from importlib.metadata import PackageNotFoundError
++from importlib.metadata import version as distribution_version
++from pathlib import Path
++
++
++def _source_tree_version() -> str | None:
++    """Read the PEP 621 version when importing directly from a checkout."""
++    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
++    if not pyproject.is_file():
++        return None
++    match = re.search(
++        r'^version\s*=\s*["\']([^"\']+)["\']\s*$',
++        pyproject.read_text(encoding="utf-8"),
++        flags=re.MULTILINE,
++    )
++    return match.group(1) if match else None
++
++
++def get_version() -> str:
++    """Return one identity for source imports and installed wheels."""
++    source_version = _source_tree_version()
++    if source_version is not None:
++        return source_version
++    try:
++        return distribution_version("comfy-kitchen")
++    except PackageNotFoundError:
++        return "0+unknown"
++
++
++__version__ = get_version()
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/eager/__init__.py b/comfy_kitchen/backends/eager/__init__.py
+--- a/comfy_kitchen/backends/eager/__init__.py	2026-10-09 23:24:10.267086827 +0000
++++ b/comfy_kitchen/backends/eager/__init__.py	2026-10-09 05:30:54.497827332 +0000
+@@ -32,6 +32,7 @@
+     "dequantize_int8_convrot_weight_dtype",
+     "dequantize_int8_embedding",
+     "dequantize_convrot_w4a4_weight",
++    "dequantize_gguf",
+     "dequantize_w4a8_int8_weight",
+     "gemv_awq_w4a16",
+     "convrot_w4a4_linear",
+@@ -50,9 +51,11 @@
+     "scaled_mm_mxfp8",
+     "scaled_mm_nvfp4",
+     "scaled_mm_svdquant_w4a4",
++    "svdquant_w4a16_linear",
+     "stochastic_rounding_fp8",
+     "fp16_linear",
+     "int8_linear",
++    "mm_int8",
+     "w4a8_int8_linear",
+ ]
+ 
+@@ -78,6 +81,7 @@
+     quantize_convrot_w4a4_weight,
+ )
+ from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out
++from .gguf import dequantize_gguf
+ from .na import na3d
+ from .quantization import (
+     dequantize_int8_convrot_weight,
+@@ -90,6 +94,7 @@
+     dequantize_per_tensor_fp8,
+     fp16_linear,
+     int8_linear,
++    mm_int8,
+     quantize_and_rotate_rowwise,
+     quantize_int8_convrot_weight,
+     quantize_int8_rowwise,
+@@ -122,6 +127,7 @@
+ )
+ from .sol_attn import sol_attn
+ from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
++from .svdquant_w4a16 import svdquant_w4a16_linear
+ from .w4a8_int8 import (
+     dequantize_w4a8_int8_weight,
+     quantize_w4a8_int8_weight,
+@@ -461,6 +467,64 @@
+         ),
+     }
+ 
++    # Fork extensions retained across the upstream 0.2.28 synchronization.
++    out["dequantize_gguf"] = FunctionConstraints(
++        params={
++            "data": ParamConstraint(dtypes=frozenset({torch.uint8})),
++            "quant_type_code": ParamConstraint(dtypes=frozenset({int})),
++            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
++            "layout_code": ParamConstraint(dtypes=frozenset({int})),
++        },
++        default_devices=all_devices,
++    )
++    out["svdquant_w4a16_linear"] = FunctionConstraints(
++        params={
++            "x": ParamConstraint(
++                dtypes=frozenset({torch.float16, torch.bfloat16}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "packed_u4": ParamConstraint(
++                dtypes=frozenset({torch.uint8}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "scales_f16": ParamConstraint(
++                dtypes=frozenset({torch.float16}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "rcp_smooth_f16": ParamConstraint(
++                dtypes=frozenset({torch.float16}),
++                shape_rules=(ExactDims(1),),
++            ),
++            "lora_down": ParamConstraint(
++                dtypes=frozenset({torch.float16, torch.bfloat16}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "lora_up": ParamConstraint(
++                dtypes=frozenset({torch.float16, torch.bfloat16}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "bias": ParamConstraint(
++                dtypes=frozenset({torch.float16, torch.bfloat16}),
++                shape_rules=(ExactDims(1),),
++            ),
++            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
++        },
++        default_devices=all_devices,
++    )
++    out["mm_int8"] = FunctionConstraints(
++        params={
++            "a": ParamConstraint(
++                dtypes=frozenset({torch.int8}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "b": ParamConstraint(
++                dtypes=frozenset({torch.int8}),
++                shape_rules=(ExactDims(2),),
++            ),
++        },
++        default_devices=all_devices,
++    )
++
+     out["quantize_int8_tensorwise"] = FunctionConstraints(
+         params={
+             "x": ParamConstraint(dtypes=standard_floats),
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/eager/adaln.py b/comfy_kitchen/backends/eager/adaln.py
+--- a/comfy_kitchen/backends/eager/adaln.py	2026-10-09 23:24:10.267212489 +0000
++++ b/comfy_kitchen/backends/eager/adaln.py	2026-10-09 05:30:23.297357075 +0000
+@@ -57,4 +57,3 @@
+ @_op_rms_adaln.register_fake
+ def _op_rms_adaln_fake(x, scale, shift, eps):
+     return torch.empty_like(x)
+-
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/eager/gguf.py b/comfy_kitchen/backends/eager/gguf.py
+--- a/comfy_kitchen/backends/eager/gguf.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/eager/gguf.py	2026-10-09 05:30:23.297449035 +0000
+@@ -0,0 +1,239 @@
++# SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# GGUF block layout formulas follow City96/ComfyUI-GGUF's Apache-2.0
++# dequantization implementation.
++
++"""Portable PyTorch reference implementation for GGUF block dequantization."""
++
++from __future__ import annotations
++
++import torch
++
++from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE
++from comfy_kitchen.gguf import (
++    GGUF_BLOCK_BYTES,
++    GGUF_BLOCK_ELEMENTS,
++    GGUF_LAYOUT_CODE_TO_NAME,
++    GGUF_QUANT_CODE_TO_TYPE,
++    _record_gguf_route,
++)
++from comfy_kitchen.registry import registry
++
++_QK_K = 256
++_K_SCALE_SIZE = 12
++
++
++def _validate_codes(
++    quant_type_code: int,
++    output_dtype_code: int,
++    layout_code: int,
++) -> tuple[torch.dtype, str]:
++    if quant_type_code not in GGUF_QUANT_CODE_TO_TYPE:
++        raise ValueError(f"unsupported GGUF quant_type_code {quant_type_code}")
++    if output_dtype_code not in DTYPE_CODE_TO_DTYPE:
++        raise ValueError(f"unsupported GGUF output_dtype_code {output_dtype_code}")
++    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
++    if output_dtype not in (torch.float16, torch.bfloat16):
++        raise ValueError(f"unsupported GGUF output dtype {output_dtype}")
++    if layout_code not in GGUF_LAYOUT_CODE_TO_NAME:
++        raise ValueError(f"unsupported GGUF layout_code {layout_code}")
++    layout = GGUF_LAYOUT_CODE_TO_NAME[layout_code]
++    if quant_type_code != 0 and layout != "comfyui":
++        raise ValueError(
++            f"layout={layout!r} is only defined for q4_0; "
++            f"{GGUF_QUANT_CODE_TO_TYPE[quant_type_code]} requires layout='comfyui'"
++        )
++    return output_dtype, layout
++
++
++def _blocks(data: torch.Tensor, quant_type_code: int) -> torch.Tensor:
++    block_bytes = GGUF_BLOCK_BYTES[quant_type_code]
++    if data.dtype != torch.uint8:
++        raise TypeError(f"GGUF storage must be torch.uint8, got {data.dtype}")
++    if data.numel() % block_bytes:
++        raise ValueError(
++            f"{GGUF_QUANT_CODE_TO_TYPE[quant_type_code]} data has {data.numel()} bytes; "
++            f"expected a multiple of {block_bytes}"
++        )
++    block_count = data.numel() // block_bytes
++    return data.reshape(-1).contiguous().view(block_count, block_bytes)
++
++
++def _fp16_column(data: torch.Tensor, output_dtype: torch.dtype) -> torch.Tensor:
++    return data.contiguous().view(torch.float16).to(output_dtype)
++
++
++def _dequantize_q4_0(
++    blocks: torch.Tensor,
++    output_dtype: torch.dtype,
++    layout: str,
++) -> torch.Tensor:
++    scale = _fp16_column(blocks[:, :2], output_dtype)
++    packed = blocks[:, 2:]
++    low = (packed & 0x0F).to(torch.int8) - 8
++    high = (packed >> 4).to(torch.int8) - 8
++    if layout == "comfyui":
++        values = torch.cat((low, high), dim=1)
++    else:
++        values = torch.stack((low, high), dim=-1).reshape(blocks.shape[0], 32)
++    return (scale * values.to(output_dtype)).reshape(-1)
++
++
++def _dequantize_q4_1(
++    blocks: torch.Tensor,
++    output_dtype: torch.dtype,
++) -> torch.Tensor:
++    scale = _fp16_column(blocks[:, :2], output_dtype)
++    minimum = _fp16_column(blocks[:, 2:4], output_dtype)
++    packed = blocks[:, 4:]
++    low = packed & 0x0F
++    high = packed >> 4
++    values = torch.cat((low, high), dim=1).to(output_dtype)
++    return (scale * values + minimum).reshape(-1)
++
++
++def _dequantize_q8_0(
++    blocks: torch.Tensor,
++    output_dtype: torch.dtype,
++) -> torch.Tensor:
++    scale = _fp16_column(blocks[:, :2], output_dtype)
++    values = blocks[:, 2:].view(torch.int8).to(output_dtype)
++    return (scale * values).reshape(-1)
++
++
++def _get_scale_min(scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    n_blocks = scales.shape[0]
++    scales = scales.reshape(n_blocks, 3, 4)
++    scale_low, min_low, mixed_high = scales.unbind(dim=1)
++    scale = torch.cat(
++        (
++            scale_low & 0x3F,
++            (mixed_high & 0x0F) | ((scale_low >> 2) & 0x30),
++        ),
++        dim=1,
++    )
++    minimum = torch.cat(
++        (
++            min_low & 0x3F,
++            (mixed_high >> 4) | ((min_low >> 2) & 0x30),
++        ),
++        dim=1,
++    )
++    return scale, minimum
++
++
++def _dequantize_q4_k(
++    blocks: torch.Tensor,
++    output_dtype: torch.dtype,
++) -> torch.Tensor:
++    d = _fp16_column(blocks[:, :2], output_dtype)
++    dmin = _fp16_column(blocks[:, 2:4], output_dtype)
++    scales, minimum = _get_scale_min(blocks[:, 4 : 4 + _K_SCALE_SIZE])
++
++    group_scale = (d * scales.to(output_dtype)).reshape(blocks.shape[0], 8, 1)
++    group_min = (dmin * minimum.to(output_dtype)).reshape(blocks.shape[0], 8, 1)
++
++    packed = blocks[:, 4 + _K_SCALE_SIZE :]
++    low = packed.reshape(blocks.shape[0], 4, 32) & 0x0F
++    high = packed.reshape(blocks.shape[0], 4, 32) >> 4
++    values = torch.stack((low, high), dim=2).reshape(blocks.shape[0], 8, 32)
++    return (group_scale * values.to(output_dtype) - group_min).reshape(-1)
++
++
++def _dequantize_q6_k(
++    blocks: torch.Tensor,
++    output_dtype: torch.dtype,
++) -> torch.Tensor:
++    ql = blocks[:, : _QK_K // 2]
++    qh = blocks[:, _QK_K // 2 : 3 * _QK_K // 4]
++    scales = blocks[:, 3 * _QK_K // 4 : 3 * _QK_K // 4 + _QK_K // 16]
++    d = blocks[:, -2:]
++
++    ql_chunks = ql.reshape(blocks.shape[0], 2, 64)
++    ql_values = torch.stack((ql_chunks & 0x0F, ql_chunks >> 4), dim=2).reshape(
++        blocks.shape[0], 8, 32
++    )
++
++    qh_chunks = qh.reshape(blocks.shape[0], 2, 32)
++    qh_values = torch.stack(
++        tuple((qh_chunks >> shift) & 0x03 for shift in (0, 2, 4, 6)),
++        dim=2,
++    ).reshape(blocks.shape[0], 8, 32)
++
++    values = (ql_values | (qh_values << 4)).to(torch.int8) - 32
++    values = values.reshape(blocks.shape[0], _QK_K // 16, 16)
++    group_scale = (
++        _fp16_column(d, output_dtype) * scales.view(torch.int8).to(output_dtype)
++    ).reshape(blocks.shape[0], _QK_K // 16, 1)
++    return (group_scale * values.to(output_dtype)).reshape(-1)
++
++
++def _dequantize_gguf_impl(
++    data: torch.Tensor,
++    quant_type_code: int,
++    output_dtype_code: int,
++    layout_code: int,
++) -> torch.Tensor:
++    """Dequantize supported GGUF blocks with portable PyTorch operations."""
++    output_dtype, layout = _validate_codes(
++        quant_type_code, output_dtype_code, layout_code
++    )
++    blocks = _blocks(data, quant_type_code)
++    if quant_type_code == 0:
++        return _dequantize_q4_0(blocks, output_dtype, layout)
++    if quant_type_code == 1:
++        return _dequantize_q8_0(blocks, output_dtype)
++    if quant_type_code == 2:
++        return _dequantize_q4_k(blocks, output_dtype)
++    if quant_type_code == 3:
++        return _dequantize_q6_k(blocks, output_dtype)
++    return _dequantize_q4_1(blocks, output_dtype)
++
++
++def dequantize_gguf(
++    data: torch.Tensor,
++    quant_type_code: int,
++    output_dtype_code: int,
++    layout_code: int,
++) -> torch.Tensor:
++    output = _dequantize_gguf_impl(
++        data, quant_type_code, output_dtype_code, layout_code
++    )
++    _record_gguf_route("eager")
++    return output
++
++
++@torch.library.custom_op("comfy_kitchen::dequantize_gguf", mutates_args=())
++def _op_dequantize_gguf(
++    data: torch.Tensor,
++    quant_type_code: int,
++    output_dtype_code: int,
++    layout_code: int,
++) -> torch.Tensor:
++    kwargs = {
++        "data": data,
++        "quant_type_code": quant_type_code,
++        "output_dtype_code": output_dtype_code,
++        "layout_code": layout_code,
++    }
++    impl = registry.get_implementation("dequantize_gguf", kwargs=kwargs)
++    return impl(**kwargs)
++
++
++@_op_dequantize_gguf.register_fake
++def _op_dequantize_gguf_fake(
++    data: torch.Tensor,
++    quant_type_code: int,
++    output_dtype_code: int,
++    layout_code: int,
++) -> torch.Tensor:
++    output_dtype, _ = _validate_codes(
++        quant_type_code, output_dtype_code, layout_code
++    )
++    block_count = data.numel() // GGUF_BLOCK_BYTES[quant_type_code]
++    output_elements = block_count * GGUF_BLOCK_ELEMENTS[quant_type_code]
++    return torch.empty(output_elements, dtype=output_dtype, device=data.device)
++
++
++__all__ = ["dequantize_gguf"]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/eager/svdquant_w4a16.py b/comfy_kitchen/backends/eager/svdquant_w4a16.py
+--- a/comfy_kitchen/backends/eager/svdquant_w4a16.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/eager/svdquant_w4a16.py	2026-10-09 05:30:23.297568987 +0000
+@@ -0,0 +1,151 @@
++"""Portable eager reference for SVDQuant W4A16 linear."""
++
++from __future__ import annotations
++
++import torch
++
++from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE
++from comfy_kitchen.registry import registry
++from comfy_kitchen.svdquant_w4a16 import _record_svdquant_w4a16_route
++
++
++def _unpack_prepared_weight(packed_u4: torch.Tensor) -> torch.Tensor:
++    signed = packed_u4.view(torch.uint8) ^ 0x88
++    low = (signed & 0x0F).to(torch.int16)
++    high = ((signed >> 4) & 0x0F).to(torch.int16)
++    low = torch.where(low >= 8, low - 16, low)
++    high = torch.where(high >= 8, high - 16, high)
++    return torch.stack((low, high), dim=-1).reshape(
++        signed.shape[0],
++        signed.shape[1] * 2,
++    )
++
++
++def _svdquant_w4a16_linear_impl(
++    x: torch.Tensor,
++    packed_u4: torch.Tensor,
++    scales_f16: torch.Tensor,
++    rcp_smooth_f16: torch.Tensor | None,
++    lora_down: torch.Tensor | None,
++    lora_up: torch.Tensor | None,
++    bias: torch.Tensor | None,
++    output_dtype_code: int,
++) -> torch.Tensor:
++    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
++    m, k = x.shape
++    n = packed_u4.shape[0]
++    groups = scales_f16.shape[0]
++    group_size = k // groups
++
++    if rcp_smooth_f16 is None:
++        x_gemm = x.to(torch.float16)
++    else:
++        x_gemm = (
++            x.float() * rcp_smooth_f16.float()
++        ).to(torch.float16)
++        x_gemm = torch.nan_to_num(
++            x_gemm,
++            nan=0.0,
++            posinf=65504.0,
++            neginf=-65504.0,
++        )
++
++    weight_int = _unpack_prepared_weight(packed_u4).float()
++    weight = (
++        weight_int.reshape(n, groups, group_size)
++        * scales_f16.float().t().unsqueeze(-1)
++    ).reshape(n, k)
++    main = x_gemm.float() @ weight.t()
++
++    has_lora = lora_down is not None and lora_up is not None
++    if has_lora or bias is not None:
++        dst = torch.zeros(m, n, dtype=torch.bfloat16, device=x.device)
++        if has_lora:
++            lora = (
++                x.to(torch.bfloat16) @ lora_down.to(torch.bfloat16)
++            ) @ lora_up.to(torch.bfloat16).t()
++            dst.add_(lora)
++        if bias is not None:
++            dst.add_(bias.to(torch.bfloat16))
++        result = (dst.float() + main).to(torch.bfloat16)
++    else:
++        result = main.to(torch.float16)
++    return result.to(output_dtype)
++
++
++def svdquant_w4a16_linear(
++    x: torch.Tensor,
++    packed_u4: torch.Tensor,
++    scales_f16: torch.Tensor,
++    rcp_smooth_f16: torch.Tensor | None,
++    lora_down: torch.Tensor | None,
++    lora_up: torch.Tensor | None,
++    bias: torch.Tensor | None,
++    output_dtype_code: int,
++) -> torch.Tensor:
++    output = _svdquant_w4a16_linear_impl(
++        x,
++        packed_u4,
++        scales_f16,
++        rcp_smooth_f16,
++        lora_down,
++        lora_up,
++        bias,
++        output_dtype_code,
++    )
++    _record_svdquant_w4a16_route("eager")
++    return output
++
++
++@torch.library.custom_op(
++    "comfy_kitchen::svdquant_w4a16_linear",
++    mutates_args=(),
++)
++def _op_svdquant_w4a16_linear(
++    x: torch.Tensor,
++    packed_u4: torch.Tensor,
++    scales_f16: torch.Tensor,
++    rcp_smooth_f16: torch.Tensor | None,
++    lora_down: torch.Tensor | None,
++    lora_up: torch.Tensor | None,
++    bias: torch.Tensor | None,
++    output_dtype_code: int,
++) -> torch.Tensor:
++    kwargs = {
++        "x": x,
++        "packed_u4": packed_u4,
++        "scales_f16": scales_f16,
++        "rcp_smooth_f16": rcp_smooth_f16,
++        "lora_down": lora_down,
++        "lora_up": lora_up,
++        "bias": bias,
++        "output_dtype_code": output_dtype_code,
++    }
++    implementation = registry.get_implementation(
++        "svdquant_w4a16_linear",
++        kwargs=kwargs,
++    )
++    return implementation(**kwargs)
++
++
++@_op_svdquant_w4a16_linear.register_fake
++def _op_svdquant_w4a16_linear_fake(
++    x,
++    packed_u4,
++    scales_f16,
++    rcp_smooth_f16,
++    lora_down,
++    lora_up,
++    bias,
++    output_dtype_code,
++):
++    del scales_f16, rcp_smooth_f16, lora_down, lora_up, bias
++    return torch.empty(
++        x.shape[0],
++        packed_u4.shape[0],
++        dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code],
++        device=x.device,
++    )
++
++
++__all__ = ["svdquant_w4a16_linear"]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/triton/__init__.py b/comfy_kitchen/backends/triton/__init__.py
+--- a/comfy_kitchen/backends/triton/__init__.py	2026-10-09 23:24:10.567574680 +0000
++++ b/comfy_kitchen/backends/triton/__init__.py	2026-10-09 05:30:23.297726699 +0000
+@@ -30,6 +30,9 @@
+ ]
+ 
+ # Try to import triton and register if available
++import os
++import sys
++
+ import torch
+ 
+ from comfy_kitchen.constraints import (
+@@ -43,6 +46,12 @@
+ 
+ _TRITON_AVAILABLE = True
+ _TRITON_ERROR = None
++_WINDOWS_TRITON_ENV = "COMFY_KITCHEN_ENABLE_TRITON_WINDOWS"
++
++
++def _windows_triton_opted_in() -> bool:
++    value = os.environ.get(_WINDOWS_TRITON_ENV, "")
++    return value.strip().lower() in {"1", "true", "yes", "on"}
+ 
+ try:
+     import triton  # noqa: F401
+@@ -341,6 +350,14 @@
+ 
+ 
+ def _register():
++    if sys.platform == "win32" and not _windows_triton_opted_in():
++        registry.mark_unavailable(
++            "triton",
++            "Triton is unavailable by default on Windows; "
++            f"set {_WINDOWS_TRITON_ENV}=1 before importing comfy_kitchen to enable it",
++        )
++        return
++
+     if not _TRITON_AVAILABLE:
+         registry.mark_unavailable("triton", _TRITON_ERROR or "Triton not available")
+         return
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/xpu/__init__.py b/comfy_kitchen/backends/xpu/__init__.py
+--- a/comfy_kitchen/backends/xpu/__init__.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/xpu/__init__.py	2026-10-09 08:26:04.330303149 +0000
+@@ -0,0 +1,761 @@
++"""Intel XPU backend powered by the optional omni_xpu_kernel package."""
++
++from __future__ import annotations
++
++import sys
++
++import torch
++
++from comfy_kitchen.constraints import ExactDims, FunctionConstraints, ParamConstraint
++from comfy_kitchen.registry import registry
++
++__all__ = [
++    "adaln",
++    "rms_adaln",
++    "apply_rope",
++    "apply_rope_",
++    "apply_rope1",
++    "apply_rope1_",
++    "apply_rope_split_half",
++    "apply_rope_split_half_",
++    "apply_rope_split_half1",
++    "apply_rope_split_half1_",
++    "convrot_w4a4_linear",
++    "dequantize_convrot_w4a4_weight",
++    "dequantize_gguf",
++    "dequantize_per_tensor_fp8",
++    "dequantize_int8_convrot_weight",
++    "dequantize_int8_convrot_weight_dtype",
++    "dequantize_int8_simple",
++    "dequantize_int8_simple_dtype",
++    "int8_linear",
++    "mm_int8",
++    "prepare_int4_weight_for_int8_linear",
++    "quantize_and_rotate_rowwise",
++    "quantize_int8_convrot_weight",
++    "quantize_int8_rowwise",
++    "quantize_int8_tensorwise",
++    "quantize_convrot_w4a4_weight",
++    "quantize_per_tensor_fp8",
++    "rms_rope",
++    "rms_rope_",
++    "rms_rope1",
++    "rms_rope1_",
++    "rms_rope_split_half",
++    "rms_rope_split_half_",
++    "rms_rope_split_half1",
++    "rms_rope_split_half1_",
++    "quantize_svdquant_w4a4",
++    "scaled_mm_svdquant_w4a4",
++    "svdquant_w4a16_linear",
++    "stochastic_rounding_fp8",
++]
++
++_AVAILABLE = False
++_ERROR = None
++_NATIVE_CAPABILITIES = frozenset()
++_INT8_AVAILABLE = False
++_INT8_ERROR = None
++_SVDQ_AVAILABLE = False
++_SVDQ_W4A16_AVAILABLE = False
++_NORM_AVAILABLE = False
++_FP8_AVAILABLE = False
++_FP8_QDQ_AVAILABLE = False
++_ROPE_AVAILABLE = False
++_RMS_ROPE_AVAILABLE = False
++_CONVROT_NATIVE_AVAILABLE = False
++_GGUF_AVAILABLE = False
++
++_REQUIRED_NATIVE_INT8_OPS = frozenset(
++    {
++        "dequantize_int8_simple",
++        "dequantize_int8_simple_dtype",
++        "int8_linear",
++        "mm_int8",
++        "quantize_int8_rowwise",
++        "quantize_int8_tensorwise",
++    }
++)
++
++try:
++    import omni_xpu_kernel
++    from omni_xpu_kernel import int8 as _int8
++
++    if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
++        _ERROR = "PyTorch XPU is not available on this system"
++    elif not omni_xpu_kernel.is_available():
++        _ERROR = "omni_xpu_kernel native extension is not available"
++    else:
++        _extension = omni_xpu_kernel._load_extension()
++        _AVAILABLE = True
++        _native_int8 = getattr(_extension, "int8", None)
++        _NATIVE_CAPABILITIES = frozenset(
++            name
++            for name in _REQUIRED_NATIVE_INT8_OPS
++            if _native_int8 is not None and hasattr(_native_int8, name)
++        )
++        missing = _REQUIRED_NATIVE_INT8_OPS - _NATIVE_CAPABILITIES
++        if missing:
++            _INT8_ERROR = "omni_xpu_kernel INT8 extension is missing: " + ", ".join(
++                sorted(missing)
++            )
++        else:
++            _INT8_AVAILABLE = True
++
++        _native_svdq = getattr(_extension, "svdq", None)
++        _SVDQ_AVAILABLE = _native_svdq is not None and all(
++            hasattr(_native_svdq, name)
++            for name in (
++                "dequantize_svdq_w4",
++                "quantize_svdq_act_int4",
++                "onednn_int4_gemm",
++            )
++        )
++        _SVDQ_W4A16_AVAILABLE = _native_svdq is not None and all(
++            hasattr(_native_svdq, name)
++            for name in (
++                "fused_smooth_mul_convert",
++                "onednn_int4_gemm_add_to_output",
++                "onednn_int4_gemm_preconverted",
++            )
++        )
++        _native_norm = getattr(_extension, "norm", None)
++        _NORM_AVAILABLE = _native_norm is not None and hasattr(
++            _native_norm, "layer_norm"
++        )
++        _native_linear = getattr(_extension, "linear", None)
++        _FP8_AVAILABLE = _native_linear is not None and hasattr(
++            _native_linear, "onednn_w8a16_fp8"
++        )
++        _native_fp8 = getattr(_extension, "fp8", None)
++        _FP8_QDQ_AVAILABLE = _native_fp8 is not None and all(
++            hasattr(_native_fp8, name)
++            for name in (
++                "dequantize_per_tensor",
++                "quantize_per_tensor",
++                "stochastic_rounding",
++            )
++        )
++        _native_rotary = getattr(_extension, "rotary", None)
++        _ROPE_AVAILABLE = _native_rotary is not None and all(
++            hasattr(_native_rotary, name)
++            for name in (
++                "apply_kitchen_rope",
++                "apply_kitchen_rope1",
++                "apply_kitchen_rope_split_half",
++                "apply_kitchen_rope_split_half1",
++            )
++        )
++        _RMS_ROPE_AVAILABLE = _native_rotary is not None and all(
++            hasattr(_native_rotary, name)
++            for name in ("rms_kitchen_rope", "rms_kitchen_rope1")
++        )
++        _CONVROT_NATIVE_AVAILABLE = _native_int8 is not None and all(
++            hasattr(_native_int8, name)
++            for name in (
++                "dequantize_int8_convrot_weight",
++                "quantize_int8_convrot_weight",
++                "rotate_convrot",
++            )
++        )
++        _native_gguf = getattr(_extension, "gguf", None)
++        _GGUF_AVAILABLE = _native_gguf is not None and all(
++            hasattr(_native_gguf, name)
++            for name in (
++                "dequantize_q4_0",
++                "dequantize_q4_1",
++                "dequantize_q8_0",
++                "dequantize_q4_k",
++                "dequantize_q6_k",
++            )
++        )
++except (ImportError, OSError, RuntimeError) as exc:
++    _ERROR = f"{type(exc).__name__}: {exc}"
++
++
++if _AVAILABLE:
++    if _INT8_AVAILABLE:
++        quantize_int8_tensorwise = _int8.quantize_int8_tensorwise
++        quantize_int8_rowwise = _int8.quantize_int8_rowwise
++        dequantize_int8_simple = _int8.dequantize_int8_simple
++        mm_int8 = _int8.mm_int8
++        quantize_int8_convrot_weight = _int8.quantize_int8_convrot_weight
++        dequantize_int8_convrot_weight = _int8.dequantize_int8_convrot_weight
++
++        _INT8_LINEAR_DTYPES = (
++            torch.float32,
++            torch.float16,
++            torch.bfloat16,
++        )
++        _INT8_LINEAR_INPUT_ACTS = (None, "none", "gelu_tanh", "swiglu")
++
++        @torch.library.custom_op(
++            "comfy_kitchen_xpu::int8_linear",
++            mutates_args=(),
++        )
++        def _compiled_int8_linear(
++            x: torch.Tensor,
++            weight: torch.Tensor,
++            weight_scale: torch.Tensor,
++            bias: torch.Tensor | None,
++            output_dtype_code: int,
++            convrot: bool,
++            convrot_groupsize: int,
++            input_act_code: int,
++        ) -> torch.Tensor:
++            return _int8.int8_linear(
++                x,
++                weight,
++                weight_scale,
++                bias,
++                _INT8_LINEAR_DTYPES[output_dtype_code],
++                convrot,
++                convrot_groupsize,
++                _INT8_LINEAR_INPUT_ACTS[input_act_code],
++            )
++
++        @_compiled_int8_linear.register_fake
++        def _compiled_int8_linear_fake(
++            x,
++            weight,
++            weight_scale,
++            bias,
++            output_dtype_code,
++            convrot,
++            convrot_groupsize,
++            input_act_code,
++        ):
++            del weight_scale, bias, convrot, convrot_groupsize, input_act_code
++            return x.new_empty(
++                (*x.shape[:-1], weight.shape[0]),
++                dtype=_INT8_LINEAR_DTYPES[output_dtype_code],
++            )
++
++        def _int8_linear_core(
++            x: torch.Tensor,
++            weight: torch.Tensor,
++            weight_scale: torch.Tensor,
++            bias: torch.Tensor | None = None,
++            out_dtype: torch.dtype | None = None,
++            convrot: bool = False,
++            convrot_groupsize: int = 256,
++            input_act: str | None = None,
++        ) -> torch.Tensor:
++            if not torch.compiler.is_compiling():
++                return _int8.int8_linear(
++                    x,
++                    weight,
++                    weight_scale,
++                    bias,
++                    out_dtype,
++                    convrot,
++                    convrot_groupsize,
++                    input_act,
++                )
++
++            actual_dtype = x.dtype if out_dtype is None else out_dtype
++            output_dtype_code = {
++                torch.float32: 0,
++                torch.float16: 1,
++                torch.bfloat16: 2,
++            }.get(actual_dtype, 2)
++            try:
++                input_act_code = _INT8_LINEAR_INPUT_ACTS.index(input_act)
++            except ValueError as exc:
++                raise ValueError(f"Unsupported input_act: {input_act!r}") from exc
++            return _compiled_int8_linear(
++                x,
++                weight,
++                weight_scale,
++                bias,
++                output_dtype_code,
++                convrot,
++                convrot_groupsize,
++                input_act_code,
++            )
++
++        def int8_linear(
++            x: torch.Tensor,
++            weight: torch.Tensor,
++            weight_scale: torch.Tensor,
++            bias: torch.Tensor | None = None,
++            out_dtype: torch.dtype | None = None,
++            convrot: bool = False,
++            convrot_groupsize: int = 256,
++            input_act: str | None = None,
++            input_act_weight: torch.Tensor | None = None,
++            input_act_eps: float = 0.0,
++            residual: torch.Tensor | None = None,
++            residual_scale: torch.Tensor | None = None,
++        ) -> torch.Tensor:
++            if input_act not in _INT8_LINEAR_INPUT_ACTS:
++                from comfy_kitchen.backends._activations import apply_input_act
++
++                x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
++                input_act = None
++            _int8_lead_shape = None
++            if x.ndim > 2 and x.is_contiguous():
++                _int8_lead_shape = x.shape[:-1]
++                x = x.reshape(-1, x.shape[-1])
++            out = _int8_linear_core(
++                x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize, input_act
++            )
++            if _int8_lead_shape is not None:
++                out = out.reshape(*_int8_lead_shape, out.shape[-1])
++            if residual is None:
++                return out
++            from comfy_kitchen.backends._activations import apply_residual
++
++            return apply_residual(out, residual, residual_scale)
++
++    if _NORM_AVAILABLE:
++        from .adaln import adaln, rms_adaln
++
++    if _SVDQ_AVAILABLE:
++        from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
++
++    if _SVDQ_W4A16_AVAILABLE:
++        from .svdquant_w4a16 import svdquant_w4a16_linear
++
++    if _FP8_QDQ_AVAILABLE:
++        from .fp8 import (
++            dequantize_per_tensor_fp8,
++            quantize_per_tensor_fp8,
++            stochastic_rounding_fp8,
++        )
++
++    if _ROPE_AVAILABLE:
++        from .rope import (
++            apply_rope,
++            apply_rope_,
++            apply_rope1,
++            apply_rope1_,
++            apply_rope_split_half,
++            apply_rope_split_half_,
++            apply_rope_split_half1,
++            apply_rope_split_half1_,
++        )
++
++    if _RMS_ROPE_AVAILABLE:
++        from .rope import (
++            rms_rope,
++            rms_rope_,
++            rms_rope1,
++            rms_rope1_,
++            rms_rope_split_half,
++            rms_rope_split_half_,
++            rms_rope_split_half1,
++            rms_rope_split_half1_,
++        )
++
++    if _CONVROT_NATIVE_AVAILABLE and _SVDQ_AVAILABLE:
++        from .convrot_w4a4 import (
++            convrot_w4a4_linear,
++            dequantize_convrot_w4a4_weight,
++            prepare_int4_weight_for_int8_linear,
++            quantize_and_rotate_rowwise,
++            quantize_convrot_w4a4_weight,
++        )
++
++    if _GGUF_AVAILABLE:
++        from .gguf import dequantize_gguf
++
++    if _INT8_AVAILABLE:
++
++        def dequantize_int8_simple_dtype(
++            q: torch.Tensor,
++            scale: torch.Tensor,
++            output_dtype_code: int,
++        ) -> torch.Tensor:
++            """Adapt Kitchen's dtype-code ABI to omni's torch.dtype API."""
++            out_dtype = _CODE_TO_DTYPE[output_dtype_code]
++            return _int8.dequantize_int8_simple_dtype(q, scale, out_dtype)
++
++        def dequantize_int8_convrot_weight_dtype(
++            q: torch.Tensor,
++            scale: torch.Tensor,
++            group_size: int,
++            output_dtype_code: int,
++        ) -> torch.Tensor:
++            """Dequantize ConvRot weights and convert to the requested Kitchen dtype."""
++            return _int8.dequantize_int8_convrot_weight(
++                q, scale, group_size
++            ).to(_CODE_TO_DTYPE[output_dtype_code])
++
++
++_CODE_TO_DTYPE = {
++    0: torch.float32,
++    1: torch.float16,
++    2: torch.bfloat16,
++}
++
++
++def _build_constraints() -> dict[str, FunctionConstraints]:
++    xpu = frozenset({"xpu"})
++    floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
++    int8_2d = ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),))
++
++    capabilities = {
++        "quantize_int8_tensorwise": FunctionConstraints(
++            params={
++                "x": ParamConstraint(dtypes=floats),
++                "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
++                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
++            },
++            default_devices=xpu,
++        ),
++        "quantize_int8_rowwise": FunctionConstraints(
++            params={
++                "x": ParamConstraint(dtypes=floats),
++                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
++            },
++            default_devices=xpu,
++        ),
++        "dequantize_int8_simple": FunctionConstraints(
++            params={
++                "q": ParamConstraint(dtypes=frozenset({torch.int8})),
++                "scale": ParamConstraint(dtypes=floats),
++            },
++            default_devices=xpu,
++        ),
++        "dequantize_int8_simple_dtype": FunctionConstraints(
++            params={
++                "q": ParamConstraint(dtypes=frozenset({torch.int8})),
++                "scale": ParamConstraint(dtypes=floats),
++                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
++            },
++            default_devices=xpu,
++        ),
++        "int8_linear": FunctionConstraints(
++            params={
++                "x": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
++                "weight": int8_2d,
++                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
++                "bias": ParamConstraint(dtypes=floats),
++                "out_dtype": ParamConstraint(dtypes=floats),
++                "convrot": ParamConstraint(dtypes=frozenset({bool})),
++                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
++                "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
++            },
++            default_devices=xpu,
++        ),
++        "mm_int8": FunctionConstraints(
++            params={"a": int8_2d, "b": int8_2d},
++            default_devices=xpu,
++        ),
++        "quantize_int8_convrot_weight": FunctionConstraints(
++            params={
++                "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
++                "group_size": ParamConstraint(dtypes=frozenset({int})),
++                "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
++            },
++            default_devices=xpu,
++        ),
++        "dequantize_int8_convrot_weight": FunctionConstraints(
++            params={
++                "q": int8_2d,
++                "scale": ParamConstraint(dtypes=floats),
++                "group_size": ParamConstraint(dtypes=frozenset({int})),
++            },
++            default_devices=xpu,
++        ),
++        "dequantize_int8_convrot_weight_dtype": FunctionConstraints(
++            params={
++                "q": int8_2d,
++                "scale": ParamConstraint(dtypes=floats),
++                "group_size": ParamConstraint(dtypes=frozenset({int})),
++                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
++            },
++            default_devices=xpu,
++        ),
++    }
++    if not _INT8_AVAILABLE:
++        capabilities.clear()
++    if _SVDQ_AVAILABLE:
++        capabilities.update(
++            {
++                "quantize_svdquant_w4a4": FunctionConstraints(
++                    params={
++                        "x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
++                        "smooth": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
++                        "lora_down": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
++                        "pad_size": ParamConstraint(dtypes=frozenset({int})),
++                        "act_unsigned": ParamConstraint(dtypes=frozenset({bool})),
++                        "lora_x": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
++                    },
++                    default_devices=xpu,
++                ),
++                "scaled_mm_svdquant_w4a4": FunctionConstraints(
++                    params={
++                        "act": ParamConstraint(
++                            dtypes=frozenset({torch.int8, torch.uint8}), shape_rules=(ExactDims(2),)
++                        ),
++                        "wgt": ParamConstraint(dtypes=frozenset({torch.int8, torch.uint8})),
++                        "ascales": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
++                        "wscales": ParamConstraint(dtypes=floats),
++                        "lora_act_in": ParamConstraint(
++                            dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)
++                        ),
++                        "lora_up": ParamConstraint(dtypes=floats),
++                        "bias": ParamConstraint(dtypes=floats),
++                        "act_unsigned": ParamConstraint(dtypes=frozenset({bool})),
++                    },
++                    default_devices=xpu,
++                ),
++            }
++        )
++    if _SVDQ_W4A16_AVAILABLE:
++        capabilities["svdquant_w4a16_linear"] = FunctionConstraints(
++            params={
++                "x": ParamConstraint(
++                    dtypes=frozenset({torch.bfloat16}),
++                    shape_rules=(ExactDims(2),),
++                ),
++                "packed_u4": ParamConstraint(
++                    dtypes=frozenset({torch.uint8}),
++                    shape_rules=(ExactDims(2),),
++                ),
++                "scales_f16": ParamConstraint(
++                    dtypes=frozenset({torch.float16}),
++                    shape_rules=(ExactDims(2),),
++                ),
++                "rcp_smooth_f16": ParamConstraint(
++                    dtypes=frozenset({torch.float16}),
++                    shape_rules=(ExactDims(1),),
++                ),
++                "lora_down": ParamConstraint(
++                    dtypes=frozenset({torch.float16, torch.bfloat16}),
++                    shape_rules=(ExactDims(2),),
++                ),
++                "lora_up": ParamConstraint(
++                    dtypes=frozenset({torch.float16, torch.bfloat16}),
++                    shape_rules=(ExactDims(2),),
++                ),
++                "bias": ParamConstraint(
++                    dtypes=frozenset({torch.float16, torch.bfloat16}),
++                    shape_rules=(ExactDims(1),),
++                ),
++                "output_dtype_code": ParamConstraint(
++                    dtypes=frozenset({int}),
++                ),
++            },
++            default_devices=xpu,
++        )
++    if _NORM_AVAILABLE:
++        capabilities["adaln"] = FunctionConstraints(
++            params={
++                "x": ParamConstraint(dtypes=floats),
++                "scale": ParamConstraint(dtypes=floats),
++                "shift": ParamConstraint(dtypes=floats),
++            },
++            default_devices=xpu,
++        )
++        if _native_norm is not None and hasattr(_native_norm, "fused_rms_adaln"):
++            capabilities["rms_adaln"] = FunctionConstraints(
++                params={
++                    "x": ParamConstraint(dtypes=floats),
++                    "scale": ParamConstraint(dtypes=floats),
++                    "shift": ParamConstraint(dtypes=floats),
++                },
++                default_devices=xpu,
++            )
++    if _FP8_QDQ_AVAILABLE:
++        fp8_dtypes = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
++        capabilities.update(
++            {
++                "quantize_per_tensor_fp8": FunctionConstraints(
++                    params={
++                        "x": ParamConstraint(dtypes=floats),
++                        "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
++                        "output_type": ParamConstraint(dtypes=fp8_dtypes),
++                    },
++                    default_devices=xpu,
++                ),
++                "dequantize_per_tensor_fp8": FunctionConstraints(
++                    params={
++                        "x": ParamConstraint(dtypes=fp8_dtypes),
++                        "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
++                        "output_type": ParamConstraint(dtypes=floats),
++                    },
++                    default_devices=xpu,
++                ),
++                "stochastic_rounding_fp8": FunctionConstraints(
++                    params={
++                        "x": ParamConstraint(dtypes=floats),
++                        "rng": ParamConstraint(dtypes=frozenset({torch.uint8})),
++                        "output_type": ParamConstraint(dtypes=fp8_dtypes),
++                    },
++                    default_devices=xpu,
++                ),
++            }
++        )
++    if _GGUF_AVAILABLE:
++        capabilities["dequantize_gguf"] = FunctionConstraints(
++            params={
++                "data": ParamConstraint(dtypes=frozenset({torch.uint8})),
++                "quant_type_code": ParamConstraint(dtypes=frozenset({int})),
++                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
++                "layout_code": ParamConstraint(dtypes=frozenset({int})),
++            },
++            default_devices=xpu,
++        )
++    if _ROPE_AVAILABLE:
++        rope_input = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),))
++        rope_freqs = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),))
++        capabilities.update(
++            {
++                "apply_rope1": FunctionConstraints(
++                    params={"x": rope_input, "freqs_cis": rope_freqs},
++                    default_devices=xpu,
++                ),
++                "apply_rope": FunctionConstraints(
++                    params={"xq": rope_input, "xk": rope_input, "freqs_cis": rope_freqs},
++                    default_devices=xpu,
++                ),
++                "apply_rope_split_half1": FunctionConstraints(
++                    params={"x": rope_input, "freqs_cis": rope_freqs},
++                    default_devices=xpu,
++                ),
++                "apply_rope_split_half": FunctionConstraints(
++                    params={"xq": rope_input, "xk": rope_input, "freqs_cis": rope_freqs},
++                    default_devices=xpu,
++                ),
++            }
++        )
++        for inplace_name, functional_name in {
++            "apply_rope_": "apply_rope",
++            "apply_rope1_": "apply_rope1",
++            "apply_rope_split_half_": "apply_rope_split_half",
++            "apply_rope_split_half1_": "apply_rope_split_half1",
++        }.items():
++            capabilities[inplace_name] = capabilities[functional_name]
++    if _RMS_ROPE_AVAILABLE:
++        rope_input = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(4),))
++        rope_freqs = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(6),))
++        rope_scale = ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),))
++        capabilities.update(
++            {
++                "rms_rope1": FunctionConstraints(
++                    params={
++                        "x": rope_input,
++                        "freqs_cis": rope_freqs,
++                        "scale": rope_scale,
++                    },
++                    default_devices=xpu,
++                ),
++                "rms_rope": FunctionConstraints(
++                    params={
++                        "q": rope_input,
++                        "k": rope_input,
++                        "freqs_cis": rope_freqs,
++                        "q_scale": rope_scale,
++                        "k_scale": rope_scale,
++                    },
++                    default_devices=xpu,
++                ),
++                "rms_rope_split_half1": FunctionConstraints(
++                    params={
++                        "x": rope_input,
++                        "freqs_cis": rope_freqs,
++                        "scale": rope_scale,
++                    },
++                    default_devices=xpu,
++                ),
++                "rms_rope_split_half": FunctionConstraints(
++                    params={
++                        "q": rope_input,
++                        "k": rope_input,
++                        "freqs_cis": rope_freqs,
++                        "q_scale": rope_scale,
++                        "k_scale": rope_scale,
++                    },
++                    default_devices=xpu,
++                ),
++            }
++        )
++        for inplace_name, functional_name in {
++            "rms_rope_": "rms_rope",
++            "rms_rope1_": "rms_rope1",
++            "rms_rope_split_half_": "rms_rope_split_half",
++            "rms_rope_split_half1_": "rms_rope_split_half1",
++        }.items():
++            capabilities[inplace_name] = capabilities[functional_name]
++    if _CONVROT_NATIVE_AVAILABLE and _SVDQ_AVAILABLE:
++        capabilities.update(
++            {
++                "quantize_convrot_w4a4_weight": FunctionConstraints(
++                    params={
++                        "weight": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
++                        "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
++                        "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
++                        "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
++                    },
++                    default_devices=xpu,
++                ),
++                "dequantize_convrot_w4a4_weight": FunctionConstraints(
++                    params={
++                        "qdata": ParamConstraint(
++                            dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
++                        ),
++                        "scales": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
++                        "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
++                        "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
++                        "output_dtype": ParamConstraint(dtypes=floats),
++                    },
++                    default_devices=xpu,
++                ),
++                "convrot_w4a4_linear": FunctionConstraints(
++                    params={
++                        "x": ParamConstraint(dtypes=floats),
++                        "qweight": ParamConstraint(
++                            dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
++                        ),
++                        "wscales": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
++                        "bias": ParamConstraint(dtypes=floats),
++                        "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
++                        "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
++                        "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
++                    },
++                    default_devices=xpu,
++                ),
++                "prepare_int4_weight_for_int8_linear": FunctionConstraints(
++                    params={
++                        "weight": ParamConstraint(
++                            dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
++                        )
++                    },
++                    default_devices=xpu,
++                ),
++                "quantize_and_rotate_rowwise": FunctionConstraints(
++                    params={
++                        "x": ParamConstraint(dtypes=floats),
++                        "H": ParamConstraint(dtypes=floats),
++                        "group_size": ParamConstraint(dtypes=frozenset({int})),
++                        "stochastic_rounding": ParamConstraint(dtypes=frozenset({int})),
++                    },
++                    default_devices=xpu,
++                ),
++            }
++        )
++    return capabilities
++
++
++def _register() -> None:
++    if not _AVAILABLE:
++        registry.mark_unavailable("xpu", _ERROR or "omni_xpu_kernel is not available")
++        return
++    capabilities = _build_constraints()
++    if not capabilities:
++        registry.mark_unavailable(
++            "xpu",
++            _INT8_ERROR or "omni_xpu_kernel exposes no supported Kitchen capabilities",
++        )
++        return
++    registry.register(
++        name="xpu",
++        module=sys.modules[__name__],
++        capabilities=capabilities,
++    )
++
++
++_register()
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/xpu/adaln.py b/comfy_kitchen/backends/xpu/adaln.py
+--- a/comfy_kitchen/backends/xpu/adaln.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/xpu/adaln.py	2026-09-05 00:42:42.562312298 +0000
+@@ -0,0 +1,82 @@
++"""Adaptive LayerNorm adapter using omni's native XPU LayerNorm."""
++
++import torch
++from omni_xpu_kernel import norm
++
++from comfy_kitchen.backends.eager.adaln import adaln as eager_adaln
++from comfy_kitchen.backends.eager.adaln import rms_adaln as eager_rms_adaln
++
++
++def adaln(
++    x: torch.Tensor,
++    scale: torch.Tensor,
++    shift: torch.Tensor,
++    eps: float = 1e-6,
++) -> torch.Tensor:
++    """Normalize with ESIMD when supported, preserving Kitchen broadcasting."""
++    hidden = x.shape[-1]
++    if hidden % 32 or hidden > 8192 or hidden == 0:
++        return eager_adaln(x, scale, shift, eps)
++
++    shape = x.shape
++    x_2d = x.reshape(-1, hidden).contiguous()
++    mapping = _modulation_mapping(x, scale, shift)
++    native = norm._get_native()
++    if mapping is not None and hasattr(native, "fused_adaln"):
++        scale_2d, shift_2d, row_repeat = mapping
++        return norm.fused_adaln(x_2d, scale_2d, shift_2d, row_repeat, eps).reshape(shape)
++    normalized = norm.layer_norm(x_2d, None, None, eps).reshape(shape)
++    return (normalized * (1 + scale) + shift).contiguous()
++
++
++def rms_adaln(
++    x: torch.Tensor,
++    scale: torch.Tensor,
++    shift: torch.Tensor,
++    eps: float = 1e-6,
++) -> torch.Tensor:
++    """RMSNorm plus AdaLN modulation with native common-layout support."""
++    hidden = x.shape[-1]
++    if hidden % 32 or hidden > 8192 or hidden == 0:
++        return eager_rms_adaln(x, scale, shift, eps)
++
++    shape = x.shape
++    x_2d = x.reshape(-1, hidden).contiguous()
++    mapping = _modulation_mapping(x, scale, shift)
++    native = norm._get_native()
++    if mapping is not None and hasattr(native, "fused_rms_adaln"):
++        scale_2d, shift_2d, row_repeat = mapping
++        return norm.fused_rms_adaln(
++            x_2d, scale_2d, shift_2d, row_repeat, eps
++        ).reshape(shape)
++    return eager_rms_adaln(x, scale, shift, eps)
++
++
++def _modulation_mapping(
++    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor, int] | None:
++    """Map common broadcast layouts to native flattened modulation rows."""
++    if scale.shape != shift.shape or scale.dtype != x.dtype or shift.dtype != x.dtype:
++        return None
++    if scale.device != x.device or shift.device != x.device or scale.shape[-1] != x.shape[-1]:
++        return None
++    if scale.dim() > x.dim():
++        return None
++    padded = (1,) * (x.dim() - scale.dim()) + tuple(scale.shape)
++    prefix = padded[:-1]
++    x_prefix = tuple(x.shape[:-1])
++    rows = x.numel() // x.shape[-1]
++    if all(dim == 1 for dim in prefix):
++        repeat = rows
++    elif prefix == x_prefix:
++        repeat = 1
++    elif prefix[-1] == 1 and prefix[:-1] == x_prefix[:-1]:
++        repeat = x_prefix[-1]
++    else:
++        return None
++    return scale.reshape(-1, x.shape[-1]).contiguous(), shift.reshape(
++        -1, x.shape[-1]
++    ).contiguous(), repeat
++
++
++__all__ = ["adaln", "rms_adaln"]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/xpu/convrot_w4a4.py b/comfy_kitchen/backends/xpu/convrot_w4a4.py
+--- a/comfy_kitchen/backends/xpu/convrot_w4a4.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/xpu/convrot_w4a4.py	2026-09-05 00:42:42.562359998 +0000
+@@ -0,0 +1,108 @@
++"""ConvRot W4A4 implementation using omni native rotation and INT8 GEMM."""
++
++from __future__ import annotations
++
++import torch
++from omni_xpu_kernel import int8, svdq
++
++from comfy_kitchen.backends.eager import convrot_w4a4 as eager_convrot
++
++_QUANT_GROUP_SIZE = 64
++
++
++def _validate_group(quant_group_size: int) -> None:
++    if quant_group_size != _QUANT_GROUP_SIZE:
++        raise ValueError(f"int4 MMA kernel requires quant_group_size {_QUANT_GROUP_SIZE}")
++
++
++def prepare_int4_weight_for_int8_linear(weight: torch.Tensor) -> torch.Tensor:
++    """Unpack persistent signed W4 storage only when an INT8 GEMM path needs it."""
++    return svdq.unpack_int4(weight.view(torch.uint8), signed=True)
++
++
++def quantize_and_rotate_rowwise(
++    x: torch.Tensor,
++    H: torch.Tensor,  # noqa: N803
++    group_size: int,
++    stochastic_rounding: int | None = 0,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Honor the caller-provided rotation matrix, then use omni row quantization."""
++    if x.shape[-1] % group_size:
++        raise ValueError(f"features {x.shape[-1]} not divisible by group_size {group_size}")
++    grouped = x.reshape(-1, x.shape[-1] // group_size, group_size)
++    rotated = torch.matmul(grouped, H.to(device=x.device, dtype=x.dtype)).reshape_as(x)
++    return int8.quantize_int8_rowwise(rotated, stochastic_rounding or 0)
++
++
++def quantize_convrot_w4a4_weight(
++    weight: torch.Tensor,
++    convrot_groupsize: int = 256,
++    quant_group_size: int = _QUANT_GROUP_SIZE,
++    stochastic_rounding: int | None = 0,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    _validate_group(quant_group_size)
++    eager_convrot.validate_w4a4_shape(weight, convrot_groupsize, quant_group_size)
++    rotated = int8._get_native().rotate_convrot(weight, convrot_groupsize)
++    return eager_convrot.quantize_signed_int4_rowwise(rotated, stochastic_rounding)
++
++
++def dequantize_convrot_w4a4_weight(
++    qdata: torch.Tensor,
++    scales: torch.Tensor,
++    convrot_groupsize: int = 256,
++    quant_group_size: int = _QUANT_GROUP_SIZE,
++    output_dtype: torch.dtype = torch.float32,
++) -> torch.Tensor:
++    _validate_group(quant_group_size)
++    unpacked = svdq.unpack_int4(qdata.view(torch.uint8), signed=True).float()
++    rotated = unpacked * scales.float().reshape(-1, 1)
++    return int8._get_native().rotate_convrot(rotated, convrot_groupsize).to(output_dtype)
++
++
++def convrot_w4a4_linear(
++    x: torch.Tensor,
++    qweight: torch.Tensor,
++    wscales: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    convrot_groupsize: int = 256,
++    quant_group_size: int = _QUANT_GROUP_SIZE,
++    linear_dtype: str = "int4",
++) -> torch.Tensor:
++    _validate_group(quant_group_size)
++    if linear_dtype not in {"int4", "int8"}:
++        raise ValueError(
++            f"ConvRot W4A4 linear_dtype must be 'int4' or 'int8', got {linear_dtype!r}"
++        )
++    if x.shape[-1] != qweight.shape[-1] * 2:
++        raise ValueError(f"Input K={x.shape[-1]} does not match qweight K={qweight.shape[-1] * 2}")
++    if x.shape[-1] % convrot_groupsize:
++        raise ValueError(
++            f"Input K={x.shape[-1]} not divisible by convrot_groupsize {convrot_groupsize}"
++        )
++
++    original_shape = x.shape
++    x2d = x.reshape(-1, x.shape[-1]).contiguous()
++    rotated = int8._get_native().rotate_convrot(x2d, convrot_groupsize)
++    if linear_dtype == "int4":
++        packed_act, xscale = eager_convrot.quantize_signed_int4_rowwise(rotated)
++        qact = svdq.unpack_int4(packed_act.view(torch.uint8), signed=True)
++    else:
++        qact, xscale = int8.quantize_int8_rowwise(rotated)
++        xscale = xscale.reshape(-1)
++    qweight_int8 = svdq.unpack_int4(qweight.view(torch.uint8), signed=True)
++    accum = int8.mm_int8(qact, qweight_int8.t().contiguous())
++    output = accum.float() * xscale.float().reshape(-1, 1)
++    output = output * wscales.float().reshape(1, -1)
++    output = output.to(x.dtype)
++    if bias is not None:
++        output = output + bias.to(x.dtype).reshape(1, -1)
++    return output.reshape(*original_shape[:-1], qweight.shape[0])
++
++
++__all__ = [
++    "convrot_w4a4_linear",
++    "dequantize_convrot_w4a4_weight",
++    "prepare_int4_weight_for_int8_linear",
++    "quantize_and_rotate_rowwise",
++    "quantize_convrot_w4a4_weight",
++]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/xpu/fp8.py b/comfy_kitchen/backends/xpu/fp8.py
+--- a/comfy_kitchen/backends/xpu/fp8.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/xpu/fp8.py	2026-09-05 00:42:42.562387864 +0000
+@@ -0,0 +1,58 @@
++"""FP8 adapters for Intel XPU."""
++
++import torch
++from omni_xpu_kernel import fp8, linear
++
++
++def quantize_per_tensor_fp8(
++    x: torch.Tensor,
++    scale: torch.Tensor,
++    output_type: torch.dtype = torch.float8_e4m3fn,
++) -> torch.Tensor:
++    """Quantize with Kitchen's per-tensor scale convention."""
++    return fp8.quantize_per_tensor(x, scale, output_type)
++
++
++def dequantize_per_tensor_fp8(
++    x: torch.Tensor,
++    scale: torch.Tensor,
++    output_type: torch.dtype = torch.bfloat16,
++) -> torch.Tensor:
++    """Dequantize FP8 values to a Kitchen standard floating dtype."""
++    return fp8.dequantize_per_tensor(x, scale, output_type)
++
++
++def stochastic_rounding_fp8(
++    x: torch.Tensor,
++    rng: torch.Tensor,
++    output_type: torch.dtype = torch.float8_e4m3fn,
++) -> torch.Tensor:
++    """Stochastically round using Kitchen's caller-provided uint8 randomness."""
++    return fp8.stochastic_rounding(x, rng, output_type)
++
++
++def fp8_weight_only_linear(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    scale: torch.Tensor,
++    bias: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Run W8A16 oneDNN linear with Kitchen's scalar weight scale."""
++    out_features = weight.shape[0]
++    scales = scale.reshape(-1)
++    if scales.numel() == 1:
++        scales = scales.expand(out_features).contiguous()
++    return linear.onednn_w8a16_fp8(
++        x.reshape(-1, x.shape[-1]).contiguous(),
++        weight.contiguous(),
++        scales,
++        bias,
++    ).reshape(*x.shape[:-1], out_features)
++
++
++__all__ = [
++    "dequantize_per_tensor_fp8",
++    "fp8_weight_only_linear",
++    "quantize_per_tensor_fp8",
++    "stochastic_rounding_fp8",
++]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/xpu/gguf.py b/comfy_kitchen/backends/xpu/gguf.py
+--- a/comfy_kitchen/backends/xpu/gguf.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/xpu/gguf.py	2026-09-05 00:42:42.562469646 +0000
+@@ -0,0 +1,113 @@
++"""GGUF adapter for the optional Omni XPU native backend."""
++
++from __future__ import annotations
++
++import threading
++import warnings
++
++import torch
++from omni_xpu_kernel import gguf as _omni_gguf
++
++from comfy_kitchen.backends.eager.gguf import (
++    _dequantize_gguf_impl as _eager_dequantize_gguf,
++)
++from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE
++from comfy_kitchen.gguf import (
++    GGUF_LAYOUT_CODE_TO_NAME,
++    GGUF_QUANT_CODE_TO_TYPE,
++    _record_gguf_route,
++)
++
++_QUARANTINE_LOCK = threading.Lock()
++_QUARANTINED_ROUTES: dict[tuple, str] = {}
++
++
++def _route_key(
++    data: torch.Tensor,
++    quant_type_code: int,
++    output_dtype_code: int,
++    layout_code: int,
++) -> tuple:
++    return (
++        data.device.type,
++        data.device.index,
++        data.numel(),
++        quant_type_code,
++        output_dtype_code,
++        layout_code,
++    )
++
++
++def _call_native(
++    data: torch.Tensor,
++    quant_type_code: int,
++    output_dtype_code: int,
++    layout_code: int,
++) -> torch.Tensor:
++    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
++    quant_type = GGUF_QUANT_CODE_TO_TYPE[quant_type_code]
++    layout = GGUF_LAYOUT_CODE_TO_NAME[layout_code]
++    if quant_type == "q4_0":
++        if layout == "comfyui":
++            return _omni_gguf.dequantize_q4_0_comfyui(data, output_dtype)
++        return _omni_gguf.dequantize_q4_0(data, output_dtype)
++    if layout != "comfyui":
++        raise ValueError(
++            f"layout={layout!r} is only defined for q4_0; "
++            f"{quant_type} requires layout='comfyui'"
++        )
++    return getattr(_omni_gguf, f"dequantize_{quant_type}")(data, output_dtype)
++
++
++def dequantize_gguf(
++    data: torch.Tensor,
++    quant_type_code: int,
++    output_dtype_code: int,
++    layout_code: int,
++) -> torch.Tensor:
++    """Run Omni when healthy; retry safely through eager after a native failure."""
++    route_key = _route_key(
++        data, quant_type_code, output_dtype_code, layout_code
++    )
++    with _QUARANTINE_LOCK:
++        quarantined_reason = _QUARANTINED_ROUTES.get(route_key)
++    if quarantined_reason is not None:
++        _record_gguf_route(
++            "eager",
++            fallback_reason=f"quarantined after {quarantined_reason}",
++        )
++        return _eager_dequantize_gguf(
++            data, quant_type_code, output_dtype_code, layout_code
++        )
++
++    try:
++        output = _call_native(
++            data, quant_type_code, output_dtype_code, layout_code
++        )
++    except (ImportError, OSError, RuntimeError) as exc:
++        reason = f"{type(exc).__name__}: {exc}"
++        with _QUARANTINE_LOCK:
++            first_failure = route_key not in _QUARANTINED_ROUTES
++            _QUARANTINED_ROUTES[route_key] = reason
++        if first_failure:
++            warnings.warn(
++                "Comfy Kitchen GGUF XPU route failed and was quarantined for "
++                f"this process; retrying with eager: {reason}",
++                RuntimeWarning,
++                stacklevel=2,
++            )
++        _record_gguf_route("eager", fallback_reason=reason)
++        return _eager_dequantize_gguf(
++            data, quant_type_code, output_dtype_code, layout_code
++        )
++
++    _record_gguf_route("xpu")
++    return output
++
++
++def _reset_gguf_quarantine_for_tests() -> None:
++    with _QUARANTINE_LOCK:
++        _QUARANTINED_ROUTES.clear()
++
++
++__all__ = ["dequantize_gguf"]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/xpu/rope.py b/comfy_kitchen/backends/xpu/rope.py
+--- a/comfy_kitchen/backends/xpu/rope.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/xpu/rope.py	2026-09-05 00:42:42.562517277 +0000
+@@ -0,0 +1,174 @@
++"""Kitchen-compatible arbitrary-matrix RoPE adapters for Intel XPU."""
++
++import torch
++from omni_xpu_kernel import rotary
++
++from comfy_kitchen._rope_utils import check_rope_inplace
++
++
++def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
++    return rotary.apply_kitchen_rope1(x, freqs_cis)
++
++
++def apply_rope1_(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
++    check_rope_inplace(x, readonly=(freqs_cis,))
++    return rotary.apply_kitchen_rope1_(x, freqs_cis)
++
++
++def apply_rope(
++    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return rotary.apply_kitchen_rope(xq, xk, freqs_cis)
++
++
++def apply_rope_(
++    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    check_rope_inplace(xq, xk, readonly=(freqs_cis,))
++    return rotary.apply_kitchen_rope_(xq, xk, freqs_cis)
++
++
++def apply_rope_split_half1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
++    return rotary.apply_kitchen_rope_split_half1(x, freqs_cis)
++
++
++def apply_rope_split_half1_(
++    x: torch.Tensor, freqs_cis: torch.Tensor
++) -> torch.Tensor:
++    check_rope_inplace(x, readonly=(freqs_cis,))
++    return rotary.apply_kitchen_rope_split_half1_(x, freqs_cis)
++
++
++def apply_rope_split_half(
++    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return rotary.apply_kitchen_rope_split_half(xq, xk, freqs_cis)
++
++
++def apply_rope_split_half_(
++    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    check_rope_inplace(xq, xk, readonly=(freqs_cis,))
++    return rotary.apply_kitchen_rope_split_half_(xq, xk, freqs_cis)
++
++
++def rms_rope1(
++    x: torch.Tensor,
++    freqs_cis: torch.Tensor,
++    scale: torch.Tensor,
++    epsilon: float = 1e-6,
++) -> torch.Tensor:
++    return rotary.rms_kitchen_rope1(x, freqs_cis, scale, epsilon)
++
++
++def rms_rope1_(
++    x: torch.Tensor,
++    freqs_cis: torch.Tensor,
++    scale: torch.Tensor,
++    epsilon: float = 1e-6,
++) -> torch.Tensor:
++    check_rope_inplace(x, readonly=(freqs_cis, scale))
++    return rotary.rms_kitchen_rope1_(x, freqs_cis, scale, epsilon)
++
++
++def rms_rope(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    freqs_cis: torch.Tensor,
++    q_scale: torch.Tensor,
++    k_scale: torch.Tensor | None = None,
++    epsilon: float = 1e-6,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return rotary.rms_kitchen_rope(
++        q, k, freqs_cis, q_scale, k_scale, epsilon
++    )
++
++
++def rms_rope_(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    freqs_cis: torch.Tensor,
++    q_scale: torch.Tensor,
++    k_scale: torch.Tensor | None = None,
++    epsilon: float = 1e-6,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if k_scale is None:
++        k_scale = q_scale
++    check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
++    return rotary.rms_kitchen_rope_(
++        q, k, freqs_cis, q_scale, k_scale, epsilon
++    )
++
++
++def rms_rope_split_half1(
++    x: torch.Tensor,
++    freqs_cis: torch.Tensor,
++    scale: torch.Tensor,
++    epsilon: float = 1e-6,
++) -> torch.Tensor:
++    return rotary.rms_kitchen_rope_split_half1(
++        x, freqs_cis, scale, epsilon
++    )
++
++
++def rms_rope_split_half1_(
++    x: torch.Tensor,
++    freqs_cis: torch.Tensor,
++    scale: torch.Tensor,
++    epsilon: float = 1e-6,
++) -> torch.Tensor:
++    check_rope_inplace(x, readonly=(freqs_cis, scale))
++    return rotary.rms_kitchen_rope_split_half1_(
++        x, freqs_cis, scale, epsilon
++    )
++
++
++def rms_rope_split_half(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    freqs_cis: torch.Tensor,
++    q_scale: torch.Tensor,
++    k_scale: torch.Tensor | None = None,
++    epsilon: float = 1e-6,
++    rot_dim: int = 0,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return rotary.rms_kitchen_rope_split_half(
++        q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim
++    )
++
++
++def rms_rope_split_half_(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    freqs_cis: torch.Tensor,
++    q_scale: torch.Tensor,
++    k_scale: torch.Tensor | None = None,
++    epsilon: float = 1e-6,
++    rot_dim: int = 0,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if k_scale is None:
++        k_scale = q_scale
++    check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
++    return rotary.rms_kitchen_rope_split_half_(
++        q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim
++    )
++
++
++__all__ = [
++    "apply_rope",
++    "apply_rope_",
++    "apply_rope1",
++    "apply_rope1_",
++    "apply_rope_split_half",
++    "apply_rope_split_half_",
++    "apply_rope_split_half1",
++    "apply_rope_split_half1_",
++    "rms_rope",
++    "rms_rope_",
++    "rms_rope1",
++    "rms_rope1_",
++    "rms_rope_split_half",
++    "rms_rope_split_half_",
++    "rms_rope_split_half1",
++    "rms_rope_split_half1_",
++]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/xpu/svdquant.py b/comfy_kitchen/backends/xpu/svdquant.py
+--- a/comfy_kitchen/backends/xpu/svdquant.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/xpu/svdquant.py	2026-09-05 00:42:42.562567701 +0000
+@@ -0,0 +1,136 @@
++"""SVDQuant W4A4 adapters for Intel XPU via omni_xpu_kernel."""
++
++from __future__ import annotations
++
++import torch
++import torch.nn.functional as F  # noqa: N812
++from omni_xpu_kernel import svdq
++
++from comfy_kitchen.backends.eager import svdquant as eager_svdquant
++
++_GROUP_SIZE = 64
++
++
++def _ceil_div(value: int, divisor: int) -> int:
++    return -(-value // divisor)
++
++
++def prepare_svdquant_weights(
++    wgt: torch.Tensor,
++    wscales: torch.Tensor,
++    lora_up: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Convert Kitchen tile-packed checkpoint tensors to omni natural layout.
++
++    Callers that own model-loading code may call this once and retain the
++    returned tensors. Natural-layout inputs are returned without conversion.
++    """
++    natural_wgt = eager_svdquant._tile_packed_weight_to_row_major(wgt)
++    natural_scales = eager_svdquant._tile_packed_scales_to_natural(wscales)
++    natural_lora_up = eager_svdquant._tile_packed_lora_up_to_natural(lora_up)
++    return (
++        natural_wgt.contiguous(),
++        natural_scales.contiguous(),
++        natural_lora_up.contiguous(),
++    )
++
++
++def quantize_svdquant_w4a4(
++    x: torch.Tensor,
++    smooth: torch.Tensor,
++    lora_down: torch.Tensor,
++    pad_size: int = 256,
++    act_unsigned: bool = False,
++    lora_x: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Quantize signed or unsigned activations with omni ESIMD kernels."""
++    if act_unsigned and not hasattr(svdq, "quantize_act_uint4"):
++        return eager_svdquant.quantize_svdquant_w4a4(
++            x, smooth, lora_down, pad_size, act_unsigned, lora_x
++        )
++
++    if x.dim() != 2:
++        raise ValueError(f"expected 2D input, got shape {tuple(x.shape)}")
++    m, k = x.shape
++    if k % _GROUP_SIZE:
++        raise ValueError(f"K={k} not divisible by group_size={_GROUP_SIZE}")
++
++    lora_src = lora_x if lora_x is not None else x
++    lora_act = lora_src.float() @ lora_down.float()
++    quantize = svdq.quantize_act_uint4 if act_unsigned else svdq.quantize_act_int4
++    q_x, ascales = quantize((x / smooth).contiguous(), _GROUP_SIZE)
++
++    m_pad = _ceil_div(m, pad_size) * pad_size
++    if m_pad > m:
++        pad = m_pad - m
++        q_x = F.pad(q_x, (0, 0, 0, pad))
++        ascales = F.pad(ascales, (0, pad))
++        lora_act = F.pad(lora_act, (0, 0, 0, pad))
++
++    # Kitchen stores packed nibbles in int8; omni uses uint8 for the same bits.
++    return q_x.view(torch.int8), ascales, lora_act
++
++
++def scaled_mm_svdquant_w4a4(
++    act: torch.Tensor,
++    wgt: torch.Tensor,
++    ascales: torch.Tensor,
++    wscales: torch.Tensor,
++    lora_act_in: torch.Tensor,
++    lora_up: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    act_unsigned: bool = False,
++) -> torch.Tensor:
++    """Run Kitchen-equivalent SVDQuant using omni dequant and oneDNN GEMM."""
++    if act_unsigned and not hasattr(svdq, "dequantize_u4"):
++        return eager_svdquant.scaled_mm_svdquant_w4a4(
++            act, wgt, ascales, wscales, lora_act_in, lora_up, bias, act_unsigned
++        )
++
++    wgt, wscales, lora_up = prepare_svdquant_weights(wgt, wscales, lora_up)
++    compute_dtype = wscales.dtype
++
++    dequantize = svdq.dequantize_u4 if act_unsigned else svdq.dequantize_w4
++    act_fp = dequantize(act.view(torch.uint8), ascales, compute_dtype)
++    out = svdq.onednn_int4_gemm(
++        act_fp,
++        wgt.view(torch.uint8),
++        wscales,
++    )
++    lora = lora_act_in.float() @ lora_up.float().t()
++    out = out + lora.to(out.dtype)
++    if bias is not None:
++        out = out + bias
++    return out
++
++
++def scaled_mm_svdquant_w4a4_preconverted(
++    act: torch.Tensor,
++    packed_u4: torch.Tensor,
++    ascales: torch.Tensor,
++    scales_f16: torch.Tensor,
++    lora_act_in: torch.Tensor,
++    lora_up: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    compute_dtype: torch.dtype = torch.bfloat16,
++) -> torch.Tensor:
++    """Run SVDQuant with destructively prepared, single-copy XPU weights."""
++    act_fp = svdq.dequantize_w4(act.view(torch.uint8), ascales, compute_dtype)
++    out = svdq.onednn_int4_gemm_preconverted(
++        act_fp,
++        packed_u4.view(torch.uint8),
++        scales_f16,
++    )
++    lora = lora_act_in.float() @ lora_up.float().t()
++    out = out + lora.to(out.dtype)
++    if bias is not None:
++        out = out + bias
++    return out
++
++
++__all__ = [
++    "prepare_svdquant_weights",
++    "quantize_svdquant_w4a4",
++    "scaled_mm_svdquant_w4a4",
++    "scaled_mm_svdquant_w4a4_preconverted",
++]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/backends/xpu/svdquant_w4a16.py b/comfy_kitchen/backends/xpu/svdquant_w4a16.py
+--- a/comfy_kitchen/backends/xpu/svdquant_w4a16.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/backends/xpu/svdquant_w4a16.py	2026-09-05 00:42:42.562620709 +0000
+@@ -0,0 +1,178 @@
++"""SVDQuant W4A16 adapter for Omni XPU native kernels."""
++
++from __future__ import annotations
++
++import threading
++import warnings
++
++import torch
++from omni_xpu_kernel import svdq
++
++from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE
++from comfy_kitchen.backends.eager.svdquant_w4a16 import (
++    _svdquant_w4a16_linear_impl as _eager_svdquant_w4a16_linear,
++)
++from comfy_kitchen.svdquant_w4a16 import _record_svdquant_w4a16_route
++
++_QUARANTINE_LOCK = threading.Lock()
++_QUARANTINED_ROUTES: dict[tuple, str] = {}
++
++
++def _route_key(
++    x: torch.Tensor,
++    packed_u4: torch.Tensor,
++    rcp_smooth_f16: torch.Tensor | None,
++    lora_down: torch.Tensor | None,
++    bias: torch.Tensor | None,
++    output_dtype_code: int,
++) -> tuple:
++    return (
++        x.device.type,
++        x.device.index,
++        tuple(x.shape),
++        tuple(packed_u4.shape),
++        x.dtype,
++        rcp_smooth_f16 is not None,
++        lora_down is not None,
++        bias is not None,
++        output_dtype_code,
++    )
++
++
++def _call_native(
++    x: torch.Tensor,
++    packed_u4: torch.Tensor,
++    scales_f16: torch.Tensor,
++    rcp_smooth_f16: torch.Tensor | None,
++    lora_down: torch.Tensor | None,
++    lora_up: torch.Tensor | None,
++    bias: torch.Tensor | None,
++    output_dtype_code: int,
++) -> torch.Tensor:
++    x = x.contiguous()
++    if rcp_smooth_f16 is None:
++        x_gemm = x.to(torch.float16)
++    else:
++        x_gemm = svdq.fused_smooth_mul_convert(
++            x,
++            rcp_smooth_f16,
++        )
++        x_gemm.nan_to_num_(
++            nan=0.0,
++            posinf=65504.0,
++            neginf=-65504.0,
++        )
++
++    has_lora = lora_down is not None and lora_up is not None
++    if has_lora or bias is not None:
++        dst = torch.zeros(
++            x.shape[0],
++            packed_u4.shape[0],
++            dtype=torch.bfloat16,
++            device=x.device,
++        )
++        if has_lora:
++            lora = (
++                x.to(torch.bfloat16) @ lora_down.to(torch.bfloat16)
++            ) @ lora_up.to(torch.bfloat16).t()
++            dst.add_(lora)
++        if bias is not None:
++            dst.add_(bias.to(torch.bfloat16))
++        svdq.onednn_int4_gemm_add_to_output(
++            x_gemm,
++            packed_u4,
++            scales_f16,
++            dst,
++        )
++        output = dst
++    else:
++        output = svdq.onednn_int4_gemm_preconverted(
++            x_gemm,
++            packed_u4,
++            scales_f16,
++        )
++    return output.to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
++
++
++def svdquant_w4a16_linear(
++    x: torch.Tensor,
++    packed_u4: torch.Tensor,
++    scales_f16: torch.Tensor,
++    rcp_smooth_f16: torch.Tensor | None,
++    lora_down: torch.Tensor | None,
++    lora_up: torch.Tensor | None,
++    bias: torch.Tensor | None,
++    output_dtype_code: int,
++) -> torch.Tensor:
++    """Run native W4A16; quarantine a failed retry-safe route."""
++    route_key = _route_key(
++        x,
++        packed_u4,
++        rcp_smooth_f16,
++        lora_down,
++        bias,
++        output_dtype_code,
++    )
++    with _QUARANTINE_LOCK:
++        quarantined_reason = _QUARANTINED_ROUTES.get(route_key)
++    if quarantined_reason is not None:
++        _record_svdquant_w4a16_route(
++            "eager",
++            fallback_reason=f"quarantined after {quarantined_reason}",
++        )
++        return _eager_svdquant_w4a16_linear(
++            x,
++            packed_u4,
++            scales_f16,
++            rcp_smooth_f16,
++            lora_down,
++            lora_up,
++            bias,
++            output_dtype_code,
++        )
++
++    try:
++        output = _call_native(
++            x,
++            packed_u4,
++            scales_f16,
++            rcp_smooth_f16,
++            lora_down,
++            lora_up,
++            bias,
++            output_dtype_code,
++        )
++    except (ImportError, OSError, RuntimeError) as exc:
++        reason = f"{type(exc).__name__}: {exc}"
++        with _QUARANTINE_LOCK:
++            first_failure = route_key not in _QUARANTINED_ROUTES
++            _QUARANTINED_ROUTES[route_key] = reason
++        if first_failure:
++            warnings.warn(
++                "Comfy Kitchen SVDQuant W4A16 XPU route failed and was "
++                f"quarantined; retrying with eager: {reason}",
++                RuntimeWarning,
++                stacklevel=2,
++            )
++        _record_svdquant_w4a16_route("eager", fallback_reason=reason)
++        return _eager_svdquant_w4a16_linear(
++            x,
++            packed_u4,
++            scales_f16,
++            rcp_smooth_f16,
++            lora_down,
++            lora_up,
++            bias,
++            output_dtype_code,
++        )
++
++    _record_svdquant_w4a16_route("xpu")
++    return output
++
++
++def _reset_svdquant_w4a16_quarantine_for_tests() -> None:
++    with _QUARANTINE_LOCK:
++        _QUARANTINED_ROUTES.clear()
++
++
++__all__ = ["svdquant_w4a16_linear"]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/gguf.py b/comfy_kitchen/gguf.py
+--- a/comfy_kitchen/gguf.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/gguf.py	2026-10-09 05:30:23.297891924 +0000
+@@ -0,0 +1,172 @@
++"""Backend-neutral GGUF dequantization contract."""
++
++from __future__ import annotations
++
++import threading
++from collections import Counter
++from typing import Final
++
++import torch
++
++GGUF_QUANT_TYPE_TO_CODE: Final = {
++    "q4_0": 0,
++    "q8_0": 1,
++    "q4_k": 2,
++    "q6_k": 3,
++    "q4_1": 4,
++}
++GGUF_QUANT_CODE_TO_TYPE: Final = {
++    code: quant_type for quant_type, code in GGUF_QUANT_TYPE_TO_CODE.items()
++}
++
++GGUF_LAYOUT_TO_CODE: Final = {
++    "comfyui": 0,
++    "interleaved": 1,
++}
++GGUF_LAYOUT_CODE_TO_NAME: Final = {
++    code: layout for layout, code in GGUF_LAYOUT_TO_CODE.items()
++}
++
++GGUF_BLOCK_BYTES: Final = {
++    0: 18,
++    1: 34,
++    2: 144,
++    3: 210,
++    4: 20,
++}
++GGUF_BLOCK_ELEMENTS: Final = {
++    0: 32,
++    1: 32,
++    2: 256,
++    3: 256,
++    4: 32,
++}
++GGUF_OUTPUT_DTYPES: Final = frozenset({torch.float16, torch.bfloat16})
++GGUF_OUTPUT_DTYPE_TO_CODE: Final = {
++    torch.float16: 1,
++    torch.bfloat16: 2,
++}
++
++_DIAGNOSTICS_LOCK = threading.Lock()
++_ROUTE_COUNTS: Counter[str] = Counter()
++_FALLBACK_COUNTS: Counter[str] = Counter()
++
++
++def _record_gguf_route(route: str, fallback_reason: str | None = None) -> None:
++    with _DIAGNOSTICS_LOCK:
++        _ROUTE_COUNTS[route] += 1
++        if fallback_reason is not None:
++            _FALLBACK_COUNTS[fallback_reason] += 1
++
++
++def get_gguf_route_diagnostics(*, reset: bool = False) -> dict:
++    """Return routes that actually completed GGUF dequantization calls.
++
++    ``routes`` counts completed implementations, not startup capability guesses.
++    When an XPU attempt fails or is quarantined, the completed route is eager and
++    ``fallbacks`` records the native failure reason.
++    """
++    with _DIAGNOSTICS_LOCK:
++        snapshot = {
++            "routes": dict(sorted(_ROUTE_COUNTS.items())),
++            "fallbacks": dict(sorted(_FALLBACK_COUNTS.items())),
++        }
++        if reset:
++            _ROUTE_COUNTS.clear()
++            _FALLBACK_COUNTS.clear()
++    return snapshot
++
++
++def _normalize_name(value: str, *, kind: str) -> str:
++    if not isinstance(value, str):
++        raise TypeError(f"{kind} must be a string, got {type(value).__name__}")
++    return value.strip().lower()
++
++
++def _validate_dequantize_gguf(
++    data: torch.Tensor,
++    quant_type: str,
++    output_dtype: torch.dtype,
++    layout: str,
++) -> tuple[int, int, int]:
++    if not isinstance(data, torch.Tensor):
++        raise TypeError(f"data must be a torch.Tensor, got {type(data).__name__}")
++    if data.dtype != torch.uint8:
++        raise TypeError(f"data must have dtype torch.uint8, got {data.dtype}")
++
++    quant_type = _normalize_name(quant_type, kind="quant_type")
++    if quant_type not in GGUF_QUANT_TYPE_TO_CODE:
++        supported = ", ".join(sorted(GGUF_QUANT_TYPE_TO_CODE))
++        raise ValueError(f"unsupported GGUF quant_type {quant_type!r}; expected one of {supported}")
++    quant_type_code = GGUF_QUANT_TYPE_TO_CODE[quant_type]
++
++    if output_dtype not in GGUF_OUTPUT_DTYPES:
++        supported = ", ".join(str(dtype) for dtype in sorted(GGUF_OUTPUT_DTYPES, key=str))
++        raise ValueError(
++            f"unsupported GGUF output_dtype {output_dtype}; expected one of {supported}"
++        )
++    output_dtype_code = GGUF_OUTPUT_DTYPE_TO_CODE[output_dtype]
++
++    layout = _normalize_name(layout, kind="layout")
++    if layout not in GGUF_LAYOUT_TO_CODE:
++        supported = ", ".join(sorted(GGUF_LAYOUT_TO_CODE))
++        raise ValueError(f"unsupported GGUF layout {layout!r}; expected one of {supported}")
++    layout_code = GGUF_LAYOUT_TO_CODE[layout]
++    if quant_type != "q4_0" and layout != "comfyui":
++        raise ValueError(
++            f"layout={layout!r} is only defined for quant_type='q4_0'; "
++            f"{quant_type!r} requires layout='comfyui'"
++        )
++
++    block_bytes = GGUF_BLOCK_BYTES[quant_type_code]
++    if data.numel() % block_bytes:
++        raise ValueError(
++            f"{quant_type} data has {data.numel()} bytes; expected a multiple of {block_bytes}"
++        )
++    return quant_type_code, output_dtype_code, layout_code
++
++
++def dequantize_gguf(
++    data: torch.Tensor,
++    quant_type: str,
++    *,
++    output_dtype: torch.dtype = torch.float16,
++    layout: str = "comfyui",
++) -> torch.Tensor:
++    """Dequantize one packed GGUF tensor through the selected Kitchen backend.
++
++    The result is flat. Callers such as ComfyUI-GGUF retain ownership of the
++    logical tensor shape and reshape the result after dequantization.
++
++    Args:
++        data: Packed GGUF storage. Any shape is accepted; storage is flattened
++            in logical order and made contiguous before backend dispatch.
++        quant_type: One of ``q4_0``, ``q4_1``, ``q8_0``, ``q4_k`` or
++            ``q6_k``.
++        output_dtype: ``torch.float16`` or ``torch.bfloat16``.
++        layout: ``comfyui`` for the plugin's canonical layout. Q4_0 also accepts
++            ``interleaved`` for Omni's packed-byte low/high ordering.
++    """
++    quant_type_code, output_dtype_code, layout_code = _validate_dequantize_gguf(
++        data, quant_type, output_dtype, layout
++    )
++    return torch.ops.comfy_kitchen.dequantize_gguf(
++        data.reshape(-1).contiguous(),
++        quant_type_code,
++        output_dtype_code,
++        layout_code,
++    )
++
++
++__all__ = [
++    "GGUF_BLOCK_BYTES",
++    "GGUF_BLOCK_ELEMENTS",
++    "GGUF_LAYOUT_CODE_TO_NAME",
++    "GGUF_LAYOUT_TO_CODE",
++    "GGUF_OUTPUT_DTYPE_TO_CODE",
++    "GGUF_OUTPUT_DTYPES",
++    "GGUF_QUANT_CODE_TO_TYPE",
++    "GGUF_QUANT_TYPE_TO_CODE",
++    "dequantize_gguf",
++    "get_gguf_route_diagnostics",
++]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/registry.py b/comfy_kitchen/registry.py
+--- a/comfy_kitchen/registry.py	2026-10-09 23:24:10.182243686 +0000
++++ b/comfy_kitchen/registry.py	2026-10-09 05:30:54.497231921 +0000
+@@ -22,7 +22,7 @@
+         self._backends = {}  # {name: backend_module}
+         self._capabilities = {}  # {name: set of function names}
+         self._constraints = {}  # {(backend_name, func_name): FunctionConstraints}
+-        self._priority = ["ascend", "cuda", "triton", "eager"]
++        self._priority = ["xpu", "ascend", "cuda", "triton", "eager"]
+         self._disabled = set()  # Manually disabled backends
+         self._unavailable = {}  # {name: error_message} for failed backends
+         self._lock = threading.Lock()
+@@ -112,6 +112,10 @@
+         """
+         return backend_name in self._backends and backend_name not in self._disabled
+ 
++    def get_backend_override(self) -> str | None:
++        """Return the active thread-local backend override, if any."""
++        return getattr(self._thread_local, "backend_override", None)
++
+     def list_backends(self) -> dict:
+         """Return dict of all backends with their status.
+ 
+@@ -195,7 +199,10 @@
+             NoCapableBackendError: If no backend can handle the call
+         """
+         failures: dict[str, str] = {}
+-        validate = bool(kwargs)  # Skip validation if kwargs is empty/None
++        # Avoid Mapping truth-value conversion here. TorchDynamo represents the
++        # operator kwargs as a ConstDictVariable and cannot compile bool(kwargs)
++        # in fullgraph mode, while len() preserves the same empty/None contract.
++        validate = kwargs is not None and len(kwargs) != 0
+ 
+         # Check for thread-local override first
+         override = getattr(self._thread_local, "backend_override", None)
+@@ -207,11 +214,21 @@
+             elif validate:
+                 result = self.validate_backend_for_call(override, func_name, kwargs)
+                 if result.success:
+-                    logger.debug("Backend %s selected for %s (override)", override, func_name)
++                    if not torch.compiler.is_compiling():
++                        logger.debug(
++                            "Backend %s selected for %s (override)",
++                            override,
++                            func_name,
++                        )
+                     return override
+                 failures[override] = f"{result.failed_param}: {result.failure_reason}"
+             else:
+-                logger.debug("Backend %s selected for %s (override)", override, func_name)
++                if not torch.compiler.is_compiling():
++                    logger.debug(
++                        "Backend %s selected for %s (override)",
++                        override,
++                        func_name,
++                    )
+                 return override
+ 
+         # Try backends in priority order
+@@ -227,7 +244,8 @@
+                     failures[backend_name] = f"{result.failed_param}: {result.failure_reason}"
+                     continue
+ 
+-            logger.debug("Backend %s selected for %s", backend_name, func_name)
++            if not torch.compiler.is_compiling():
++                logger.debug("Backend %s selected for %s", backend_name, func_name)
+             return backend_name
+ 
+         raise NoCapableBackendError(func_name, failures)
+@@ -260,7 +278,7 @@
+                 raise BackendNotFoundError(backend, "disabled")
+             if func_name not in self._capabilities.get(backend, set()):
+                 raise BackendNotImplementedError(backend, func_name)
+-            if kwargs:
++            if kwargs is not None and len(kwargs) != 0:
+                 result = self.validate_backend_for_call(backend, func_name, kwargs)
+                 if not result.success:
+                     raise NoCapableBackendError(func_name, {backend: f"{result.failed_param}: {result.failure_reason}"})
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/scaled_mm_v2.py b/comfy_kitchen/scaled_mm_v2.py
+--- a/comfy_kitchen/scaled_mm_v2.py	2026-10-09 23:24:10.182492366 +0000
++++ b/comfy_kitchen/scaled_mm_v2.py	2026-10-09 05:30:23.298190056 +0000
+@@ -1,6 +1,7 @@
+ from typing import Optional
+ 
+ import torch
++
+ from packaging import version
+ 
+ _TORCH_VERSION = version.parse(torch.__version__.split("+")[0])  # Remove git hash suffix
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/svdquant_w4a16.py b/comfy_kitchen/svdquant_w4a16.py
+--- a/comfy_kitchen/svdquant_w4a16.py	1970-01-01 00:00:00.000000000 +0000
++++ b/comfy_kitchen/svdquant_w4a16.py	2026-10-09 05:30:23.298356935 +0000
+@@ -0,0 +1,359 @@
++"""Backend-neutral SVDQuant W4A16 preparation and linear contract."""
++
++from __future__ import annotations
++
++import os
++import threading
++from collections import Counter
++from collections.abc import Callable
++from dataclasses import dataclass, field
++
++import torch
++
++from .backends.eager.quantization import DTYPE_TO_CODE
++from .exceptions import BackendError
++
++_GROUP_SIZE = 64
++_OUTPUT_DTYPES = frozenset({torch.float16, torch.bfloat16})
++_DIAGNOSTICS_LOCK = threading.Lock()
++_ROUTE_COUNTS: Counter[str] = Counter()
++_FALLBACK_COUNTS: Counter[str] = Counter()
++_PROFILE_BOUNDARY_ENV = "COMFY_KITCHEN_PROFILE_BOUNDARIES"
++
++
++def _profile_operator_boundary_enabled() -> bool:
++    """Return whether trace runs require the public torch.library boundary."""
++    return os.environ.get(_PROFILE_BOUNDARY_ENV, "").strip() == "1"
++
++
++@dataclass(frozen=True)
++class PreparedSVDQuantW4A16:
++    """OneDNN-ready natural-layout SVDQuant weight storage.
++
++    ``packed_u4`` aliases ``source_qweight`` when ``destructive=True``. The
++    full packed weight therefore has one storage allocation; only the much
++    smaller FP16 scale tensor is converted and retained separately.
++    """
++
++    packed_u4: torch.Tensor
++    scales_f16: torch.Tensor
++    rcp_smooth_f16: torch.Tensor | None
++    source_qweight: torch.Tensor
++    source_wscales: torch.Tensor
++    source_smooth: torch.Tensor | None
++    destructive: bool
++    group_size: int
++    in_features: int
++    out_features: int
++    xpu_linear_impl: Callable[..., torch.Tensor] | None = field(
++        default=None,
++        repr=False,
++        compare=False,
++    )
++
++
++def _record_svdquant_w4a16_route(
++    route: str,
++    fallback_reason: str | None = None,
++) -> None:
++    with _DIAGNOSTICS_LOCK:
++        _ROUTE_COUNTS[route] += 1
++        if fallback_reason is not None:
++            _FALLBACK_COUNTS[fallback_reason] += 1
++
++
++def get_svdquant_w4a16_route_diagnostics(*, reset: bool = False) -> dict:
++    """Return implementations that completed W4A16 calls and fallback reasons."""
++    with _DIAGNOSTICS_LOCK:
++        snapshot = {
++            "routes": dict(sorted(_ROUTE_COUNTS.items())),
++            "fallbacks": dict(sorted(_FALLBACK_COUNTS.items())),
++        }
++        if reset:
++            _ROUTE_COUNTS.clear()
++            _FALLBACK_COUNTS.clear()
++    return snapshot
++
++
++def _validate_source_storage(
++    qweight: torch.Tensor,
++    wscales: torch.Tensor,
++    smooth: torch.Tensor | None,
++) -> tuple[int, int]:
++    if not isinstance(qweight, torch.Tensor):
++        raise TypeError(
++            f"qweight must be a torch.Tensor, got {type(qweight).__name__}"
++        )
++    if not isinstance(wscales, torch.Tensor):
++        raise TypeError(
++            f"wscales must be a torch.Tensor, got {type(wscales).__name__}"
++        )
++    if qweight.dim() != 2 or qweight.dtype not in (torch.int8, torch.uint8):
++        raise ValueError(
++            "qweight must be natural-layout int8/uint8 [N, K//2], "
++            f"got shape={tuple(qweight.shape)} dtype={qweight.dtype}"
++        )
++    if wscales.dim() != 2 or wscales.dtype not in (
++        torch.float16,
++        torch.bfloat16,
++    ):
++        raise ValueError(
++            "wscales must be FP16/BF16 [K//64, N], "
++            f"got shape={tuple(wscales.shape)} dtype={wscales.dtype}"
++        )
++    if qweight.device != wscales.device:
++        raise ValueError(
++            f"qweight and wscales must share a device, got "
++            f"{qweight.device} and {wscales.device}"
++        )
++    out_features = qweight.shape[0]
++    in_features = qweight.shape[1] * 2
++    expected_scales = (in_features // _GROUP_SIZE, out_features)
++    if in_features % _GROUP_SIZE or tuple(wscales.shape) != expected_scales:
++        raise ValueError(
++            f"wscales shape must be {expected_scales} for qweight "
++            f"shape {tuple(qweight.shape)}, got {tuple(wscales.shape)}"
++        )
++    if smooth is not None:
++        if (
++            not isinstance(smooth, torch.Tensor)
++            or smooth.dim() != 1
++            or smooth.numel() != in_features
++            or smooth.dtype not in (torch.float16, torch.bfloat16)
++            or smooth.device != qweight.device
++        ):
++            raise ValueError(
++                "smooth must be FP16/BF16 [K] on the weight device; "
++                f"expected K={in_features}"
++            )
++        if not torch.isfinite(smooth).all().item() or (smooth == 0).any().item():
++            raise ValueError("smooth must contain only finite non-zero values")
++    return in_features, out_features
++
++
++def prepare_svdquant_w4a16_for_xpu(
++    qweight: torch.Tensor,
++    wscales: torch.Tensor,
++    smooth: torch.Tensor | None = None,
++    *,
++    destructive: bool = True,
++) -> PreparedSVDQuantW4A16:
++    """Prepare natural-layout signed INT4 weights for oneDNN W4A16.
++
++    Args:
++        qweight: Nunchaku natural-layout signed INT4 bytes, shape ``[N, K//2]``.
++        wscales: Per-group scales, shape ``[K//64, N]``.
++        smooth: Optional input smooth factor ``[K]``. Its FP16 reciprocal is
++            prepared once to preserve the current Nunchaku XPU arithmetic
++            boundary.
++        destructive: XOR-convert ``qweight`` to unsigned oneDNN storage in
++            place. This is the memory-efficient model-load path.
++
++    The destructive form is intentionally one-shot. Call
++    :func:`restore_svdquant_w4a16_source_` before serializing or preparing the
++    same source tensor again.
++    """
++    in_features, out_features = _validate_source_storage(
++        qweight,
++        wscales,
++        smooth,
++    )
++    if destructive and not qweight.is_contiguous():
++        raise ValueError("destructive preparation requires contiguous qweight")
++    if getattr(qweight, "_comfy_kitchen_w4a16_prepared", False):
++        raise RuntimeError(
++            "qweight is already destructively prepared; restore it before "
++            "preparing again"
++        )
++
++    # Allocate all derived small tensors before destructively changing the
++    # full weight. If preparation runs out of memory, the model parameter
++    # remains in its checkpoint representation and is safe to retry.
++    scales_f16 = wscales.to(torch.float16).contiguous()
++    rcp_smooth_f16 = (
++        (1.0 / smooth.float()).to(torch.float16).contiguous()
++        if smooth is not None
++        else None
++    )
++
++    xpu_linear_impl = None
++    if qweight.device.type == "xpu":
++        from .registry import registry
++
++        try:
++            xpu_linear_impl = registry.get_implementation(
++                "svdquant_w4a16_linear",
++                backend="xpu",
++            )
++        except BackendError:
++            # Keep preparation portable when the companion wheel is absent or
++            # too old. The public call will use normal registry dispatch.
++            pass
++
++    if destructive:
++        packed_u4 = qweight.view(torch.uint8)
++        packed_u4.bitwise_xor_(0x88)
++        qweight._comfy_kitchen_w4a16_prepared = True
++    else:
++        packed_u4 = (qweight.view(torch.uint8) ^ 0x88).contiguous()
++    return PreparedSVDQuantW4A16(
++        packed_u4=packed_u4,
++        scales_f16=scales_f16,
++        rcp_smooth_f16=rcp_smooth_f16,
++        source_qweight=qweight,
++        source_wscales=wscales,
++        source_smooth=smooth,
++        destructive=destructive,
++        group_size=_GROUP_SIZE,
++        in_features=in_features,
++        out_features=out_features,
++        xpu_linear_impl=xpu_linear_impl,
++    )
++
++
++def restore_svdquant_w4a16_source_(
++    prepared: PreparedSVDQuantW4A16,
++) -> torch.Tensor:
++    """Restore a destructively prepared source qweight to signed INT4 bytes."""
++    if not isinstance(prepared, PreparedSVDQuantW4A16):
++        raise TypeError("prepared must be PreparedSVDQuantW4A16")
++    if not prepared.destructive:
++        return prepared.source_qweight
++    source = prepared.source_qweight
++    if not getattr(source, "_comfy_kitchen_w4a16_prepared", False):
++        raise RuntimeError("prepared source was already restored")
++    source.view(torch.uint8).bitwise_xor_(0x88)
++    source._comfy_kitchen_w4a16_prepared = False
++    return source
++
++
++def _validate_linear(
++    x: torch.Tensor,
++    prepared: PreparedSVDQuantW4A16,
++    lora_down: torch.Tensor | None,
++    lora_up: torch.Tensor | None,
++    bias: torch.Tensor | None,
++    output_dtype: torch.dtype,
++) -> None:
++    if not isinstance(prepared, PreparedSVDQuantW4A16):
++        raise TypeError("prepared must be PreparedSVDQuantW4A16")
++    if prepared.destructive and not getattr(
++        prepared.source_qweight,
++        "_comfy_kitchen_w4a16_prepared",
++        False,
++    ):
++        raise RuntimeError(
++            "destructively prepared qweight was restored; prepare it again "
++            "before running W4A16"
++        )
++    if x.dim() != 2 or x.dtype not in (torch.float16, torch.bfloat16):
++        raise ValueError(
++            f"x must be FP16/BF16 [M, K], got shape={tuple(x.shape)} "
++            f"dtype={x.dtype}"
++        )
++    if x.shape[1] != prepared.in_features:
++        raise ValueError(
++            f"x K={x.shape[1]} does not match prepared K={prepared.in_features}"
++        )
++    tensors = [prepared.packed_u4, prepared.scales_f16]
++    if prepared.rcp_smooth_f16 is not None:
++        tensors.append(prepared.rcp_smooth_f16)
++    if any(tensor.device != x.device for tensor in tensors):
++        raise ValueError("x and prepared tensors must share a device")
++    if (lora_down is None) != (lora_up is None):
++        raise ValueError("lora_down and lora_up must be both present or both absent")
++    if lora_down is not None and lora_up is not None:
++        rank = lora_down.shape[1] if lora_down.dim() == 2 else -1
++        if tuple(lora_down.shape) != (prepared.in_features, rank) or (
++            tuple(lora_up.shape) != (prepared.out_features, rank)
++        ):
++            raise ValueError(
++                "LoRA shapes must be [K, R] and [N, R], got "
++                f"{tuple(lora_down.shape)} and {tuple(lora_up.shape)}"
++            )
++        if (
++            lora_down.dtype not in _OUTPUT_DTYPES
++            or lora_up.dtype not in _OUTPUT_DTYPES
++            or lora_down.device != x.device
++            or lora_up.device != x.device
++        ):
++            raise ValueError("LoRA tensors must be FP16/BF16 on the input device")
++    if bias is not None and (
++        tuple(bias.shape) != (prepared.out_features,)
++        or bias.dtype not in _OUTPUT_DTYPES
++        or bias.device != x.device
++    ):
++        raise ValueError("bias must be FP16/BF16 [N] on the input device")
++    if output_dtype not in _OUTPUT_DTYPES:
++        raise ValueError(f"output_dtype must be FP16/BF16, got {output_dtype}")
++
++
++def svdquant_w4a16_linear(
++    x: torch.Tensor,
++    prepared: PreparedSVDQuantW4A16,
++    *,
++    lora_down: torch.Tensor | None = None,
++    lora_up: torch.Tensor | None = None,
++    bias: torch.Tensor | None = None,
++    output_dtype: torch.dtype | None = None,
++    validate: bool = True,
++) -> torch.Tensor:
++    """Run W4A16 main path plus LoRA and bias on raw, unsmoothed input.
++
++    LoRA always consumes ``x`` before smoothing. The main path consumes an FP16
++    ``x * reciprocal(smooth)`` intermediate when a smooth factor was prepared.
++    This fixes the operator boundary used by the current Nunchaku XPU route.
++
++    Set ``validate=False`` only for a model-owned prepared path whose tensor
++    shapes, dtypes, and devices were already fixed and tested. The default
++    public contract validates every call.
++    """
++    selected_dtype = x.dtype if output_dtype is None else output_dtype
++    if validate:
++        _validate_linear(
++            x,
++            prepared,
++            lora_down,
++            lora_up,
++            bias,
++            selected_dtype,
++        )
++    op_args = (
++        x,
++        prepared.packed_u4,
++        prepared.scales_f16,
++        prepared.rcp_smooth_f16,
++        lora_down,
++        lora_up,
++        bias,
++        DTYPE_TO_CODE[selected_dtype],
++    )
++
++    # Prepared XPU weights already fixed the backend and validated its native
++    # capability once at model load. Bypass torch.library and registry lookup
++    # on the per-layer hot path, while preserving explicit use_backend()
++    # overrides and runtime backend disablement for testing/recovery.
++    if (
++        prepared.xpu_linear_impl is not None
++        and not _profile_operator_boundary_enabled()
++    ):
++        from .registry import registry
++
++        if (
++            registry.get_backend_override() is None
++            and registry.is_available("xpu")
++            and x.device.type == "xpu"
++            and x.dtype == torch.bfloat16
++        ):
++            return prepared.xpu_linear_impl(*op_args)
++
++    return torch.ops.comfy_kitchen.svdquant_w4a16_linear(*op_args)
++
++
++__all__ = [
++    "PreparedSVDQuantW4A16",
++    "get_svdquant_w4a16_route_diagnostics",
++    "prepare_svdquant_w4a16_for_xpu",
++    "restore_svdquant_w4a16_source_",
++    "svdquant_w4a16_linear",
++]
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/tensor/__init__.py b/comfy_kitchen/tensor/__init__.py
+--- a/comfy_kitchen/tensor/__init__.py	2026-10-09 23:24:10.568405447 +0000
++++ b/comfy_kitchen/tensor/__init__.py	2026-10-09 05:30:23.298461749 +0000
+@@ -22,6 +22,8 @@
+ from .nvfp4 import TensorCoreNVFP4Layout
+ from .svdquant_w4a4 import (
+     TensorCoreSVDQuantW4A4Layout,
++    prepare_svdquant_for_xpu,
++    restore_svdquant_standard_format_,
+     svdquant_w4a4_can_share_quant,
+     svdquant_w4a4_fuse_linear_weights,
+     svdquant_w4a4_fused_grouped_linear,
+@@ -55,6 +57,8 @@
+     "register_layout_class",
+     "register_layout_op",
+     "quantize_convrot_w4a4_weight",
++    "prepare_svdquant_for_xpu",
++    "restore_svdquant_standard_format_",
+     "quantize_w4a8_int8_weight",
+     "svdquant_w4a4_can_share_quant",
+     "svdquant_w4a4_fuse_linear_weights",
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/tensor/base.py b/comfy_kitchen/tensor/base.py
+--- a/comfy_kitchen/tensor/base.py	2026-10-09 23:24:10.568583296 +0000
++++ b/comfy_kitchen/tensor/base.py	2026-10-09 05:30:23.298586549 +0000
+@@ -122,6 +122,16 @@
+         return {}
+ 
+     @classmethod
++    def normalize_device_storage(
++        cls,
++        qdata: torch.Tensor,
++        params: Any,
++        device: torch.device,
++    ) -> tuple[torch.Tensor, Any]:
++        """Normalize backend-specific runtime storage after a device move."""
++        return qdata, params
++
++    @classmethod
+     def supports_fast_matmul(cls) -> bool:
+         """Check if fast quantized matmul is supported on current hardware."""
+         if cls.MIN_SM_VERSION is None:
+@@ -426,6 +436,9 @@
+     if needs_device:
+         new_qdata = qt._qdata.to(device=target_device)
+         new_params = qt._params.to_device(target_device)
++        new_qdata, new_params = qt.layout_cls.normalize_device_storage(
++            new_qdata, new_params, target_device
++        )
+     else:
+         new_qdata = qt._qdata.clone() if force_copy else qt._qdata
+         new_params = qt._params.clone()
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/tensor/fp8.py b/comfy_kitchen/tensor/fp8.py
+--- a/comfy_kitchen/tensor/fp8.py	2026-10-09 23:24:10.572945748 +0000
++++ b/comfy_kitchen/tensor/fp8.py	2026-10-09 05:30:23.298754320 +0000
+@@ -140,6 +140,27 @@
+     input_tensor, weight = args[0], args[1]
+     bias = args[2] if len(args) > 2 else None
+ 
++    # Intel XPU weight-only fast path: float activation + FP8 weight.
++    if (
++        isinstance(input_tensor, torch.Tensor)
++        and not isinstance(input_tensor, QuantizedTensor)
++        and isinstance(weight, QuantizedTensor)
++        and input_tensor.device.type == "xpu"
++    ):
++        try:
++            from comfy_kitchen.backends import xpu as xpu_backend
++            from comfy_kitchen.backends.xpu.fp8 import fp8_weight_only_linear
++
++            if xpu_backend._FP8_AVAILABLE:
++                return fp8_weight_only_linear(
++                    input_tensor,
++                    weight._qdata,
++                    weight._params.scale,
++                    bias,
++                )
++        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
++            logger.debug("XPU FP8 W8A16 fast path unavailable: %s", exc)
++
+     # Fast path: both operands are FP8 QuantizedTensors
+     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):
+         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
+@@ -174,6 +195,21 @@
+     """FP8 matrix multiplication: output = a @ b"""
+     a, b = args[0], args[1]
+ 
++    if (
++        isinstance(a, torch.Tensor)
++        and not isinstance(a, QuantizedTensor)
++        and isinstance(b, QuantizedTensor)
++        and a.device.type == "xpu"
++    ):
++        try:
++            from comfy_kitchen.backends import xpu as xpu_backend
++            from comfy_kitchen.backends.xpu.fp8 import fp8_weight_only_linear
++
++            if xpu_backend._FP8_AVAILABLE:
++                return fp8_weight_only_linear(a, b._qdata.t(), b._params.scale)
++        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
++            logger.debug("XPU FP8 W8A16 mm fast path unavailable: %s", exc)
++
+     if not (isinstance(a, QuantizedTensor) and isinstance(b, QuantizedTensor)):
+         return torch.mm(*dequantize_args(args))
+ 
+@@ -192,6 +228,26 @@
+     """FP8 addmm: output = bias + input @ weight"""
+     bias, input_tensor, weight = args[0], args[1], args[2]
+ 
++    if (
++        isinstance(input_tensor, torch.Tensor)
++        and not isinstance(input_tensor, QuantizedTensor)
++        and isinstance(weight, QuantizedTensor)
++        and input_tensor.device.type == "xpu"
++    ):
++        try:
++            from comfy_kitchen.backends import xpu as xpu_backend
++            from comfy_kitchen.backends.xpu.fp8 import fp8_weight_only_linear
++
++            if xpu_backend._FP8_AVAILABLE:
++                return fp8_weight_only_linear(
++                    input_tensor,
++                    weight._qdata.t(),
++                    weight._params.scale,
++                    bias,
++                )
++        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
++            logger.debug("XPU FP8 W8A16 addmm fast path unavailable: %s", exc)
++
+     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):
+         return torch.addmm(*dequantize_args(args))
+ 
+diff -ruN -x __pycache__ -x '*.pyc' -x build -x '*.egg-info' -x '*.orig' -x '*.rej' -x '*.pre-*' -x '*.bak*' -x '*.so' -x .git -x dist a/comfy_kitchen/tensor/svdquant_w4a4.py b/comfy_kitchen/tensor/svdquant_w4a4.py
+--- a/comfy_kitchen/tensor/svdquant_w4a4.py	2026-10-09 23:24:10.573490395 +0000
++++ b/comfy_kitchen/tensor/svdquant_w4a4.py	2026-10-09 05:30:23.298921409 +0000
+@@ -16,6 +16,7 @@
+ that pure 4-bit quantization cannot represent; the dispatched kernel fuses
+ activation quantization + low-rank correction + int4 matmul into a single call.
+ """
++
+ from __future__ import annotations
+ 
+ import dataclasses
+@@ -88,6 +89,32 @@
+     return cuda_backend
+ 
+ 
++def _xpu_preconverted_mm(
++    q_x: torch.Tensor,
++    ascales: torch.Tensor,
++    lora_act: torch.Tensor,
++    weight_qt: QuantizedTensor,
++    bias: torch.Tensor | None,
++) -> torch.Tensor | None:
++    params = weight_qt._params
++    if not params.xpu_preconverted or q_x.device.type != "xpu":
++        return None
++    from comfy_kitchen.backends.xpu.svdquant import (
++        scaled_mm_svdquant_w4a4_preconverted,
++    )
++
++    return scaled_mm_svdquant_w4a4_preconverted(
++        q_x,
++        weight_qt._qdata,
++        ascales,
++        params.scale,
++        lora_act,
++        params.proj_up,
++        bias,
++        params.xpu_scale_orig_dtype or params.orig_dtype,
++    )
++
++
+ def _is_svdquant_w4a4_qtensor(tensor: torch.Tensor) -> bool:
+     return (
+         isinstance(tensor, QuantizedTensor)
+@@ -158,18 +185,33 @@
+     *,
+     m: int,
+ ) -> tuple[torch.Tensor, int]:
+-    qdata, wscales, _smooth, _proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight_qt)
++    qdata, wscales, _smooth, _proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(
++        weight_qt
++    )
+     act_unsigned = bool(getattr(weight_qt._params, "act_unsigned", False))
+-    if cuda_backend is not None:
++    out = _xpu_preconverted_mm(q_x, ascales, lora_act, weight_qt, bias)
++    if out is not None:
++        pass
++    elif cuda_backend is not None:
+         out = cuda_backend.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
+-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=wscales,
++            lora_act_in=lora_act,
++            lora_up=proj_up,
++            bias=bias,
+             act_unsigned=act_unsigned,
+         )
+     else:
+         out = ck.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
+-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=wscales,
++            lora_act_in=lora_act,
++            lora_up=proj_up,
++            bias=bias,
+             act_unsigned=act_unsigned,
+         )
+     out_features = TensorCoreSVDQuantW4A4Layout.get_out_features_from_storage(qdata)
+@@ -197,12 +239,16 @@
+     if len(biases) != len(weights):
+         raise ValueError(f"got {len(weights)} weights but {len(biases)} biases")
+     if not svdquant_w4a4_can_share_quant(
+-        weights, validate=validate_shared_quant, trust=assume_shared_quant,
++        weights,
++        validate=validate_shared_quant,
++        trust=assume_shared_quant,
+     ):
+         raise ValueError("SVDQuant weights do not share quantization parameters")
+ 
+     first = weights[0]
+-    qdata, _wscales, smooth, proj_down, _proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(first)
++    qdata, _wscales, smooth, proj_down, _proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(
++        first
++    )
+     act_unsigned = bool(getattr(first._params, "act_unsigned", False))
+ 
+     orig_shape = input_tensor.shape
+@@ -237,7 +283,13 @@
+     outputs = []
+     for weight, bias in zip(weights, biases, strict=True):
+         out2d, out_features = _w4a4_forward_from_quantized_activation(
+-            q_x, ascales, lora_act, weight, bias, cuda_backend, m=m,
++            q_x,
++            ascales,
++            lora_act,
++            weight,
++            bias,
++            cuda_backend,
++            m=m,
+         )
+         outputs.append(out2d.reshape(*orig_shape[:-1], out_features))
+     return tuple(outputs)
+@@ -272,7 +324,9 @@
+     if len(biases) != len(weights):
+         raise ValueError(f"got {len(weights)} weights but {len(biases)} biases")
+     if not svdquant_w4a4_can_share_quant(
+-        weights, validate=validate_shared_quant, trust=assume_shared_quant,
++        weights,
++        validate=validate_shared_quant,
++        trust=assume_shared_quant,
+     ):
+         raise ValueError("SVDQuant weights do not share quantization parameters")
+ 
+@@ -285,7 +339,11 @@
+     scales = []
+     proj_ups = []
+     for weight in weights:
+-        qdata, wscale, _smooth, _proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight)
++        if weight._params.xpu_preconverted != first_params.xpu_preconverted:
++            raise ValueError("cannot fuse mixed standard and XPU-preconverted weights")
++        qdata, wscale, _smooth, _proj_down, proj_up = (
++            TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight)
++        )
+         if weight._params.orig_shape[1] != in_features:
+             raise ValueError("all fused SVDQuant weights must have the same input features")
+         if bool(weight._params.act_unsigned) != act_unsigned:
+@@ -317,6 +375,8 @@
+         proj_up=fused_proj_up,
+         smooth_factor=first_params.smooth_factor,
+         act_unsigned=act_unsigned,
++        xpu_preconverted=bool(first_params.xpu_preconverted),
++        xpu_scale_orig_dtype=first_params.xpu_scale_orig_dtype,
+     )
+     return (
+         QuantizedTensor(fused_qdata, "TensorCoreSVDQuantW4A4Layout", params),
+@@ -369,11 +429,14 @@
+         low-rank correction and input smoothing, plus a logical-transpose flag
+         used by the aten.t / aten.mm dispatch path.
+         """
++
+         proj_down: torch.Tensor
+         proj_up: torch.Tensor
+         smooth_factor: torch.Tensor
+         act_unsigned: bool = False
+         transposed: bool = False
++        xpu_preconverted: bool = False
++        xpu_scale_orig_dtype: torch.dtype | None = None
+ 
+         def _tensor_fields(self) -> list[str]:
+             return ["scale", "proj_down", "proj_up", "smooth_factor"]
+@@ -412,17 +475,25 @@
+ 
+         eye = torch.eye(in_features, dtype=dtype, device=device)
+         q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
+-            eye, smooth=params.smooth_factor, lora_down=params.proj_down,
++            eye,
++            smooth=params.smooth_factor,
++            lora_down=params.proj_down,
+         )
+         w_eff = ck.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=params.scale,
+-            lora_act_in=lora_act, lora_up=params.proj_up, bias=None,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=params.scale,
++            lora_act_in=lora_act,
++            lora_up=params.proj_up,
++            bias=None,
+         )[:in_features]
+         return w_eff.t().contiguous()
+ 
+     @classmethod
+     def get_plain_tensors(
+-        cls, qtensor: QuantizedTensor,
++        cls,
++        qtensor: QuantizedTensor,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         p = qtensor._params
+         return qtensor._qdata, p.scale, p.smooth_factor, p.proj_down, p.proj_up
+@@ -441,17 +512,112 @@
+         producing for example `transformer_blocks.0.attn.to_q.weight`,
+         `...weight_scale`, `...weight_proj_down`, etc.
+         """
++        stored_qdata = qdata
++        stored_scale = params.scale
++        if params.xpu_preconverted:
++            stored_qdata = (qdata.view(torch.uint8) ^ 0x88).view(torch.int8)
++            stored_scale = params.scale.to(params.xpu_scale_orig_dtype or params.orig_dtype)
+         return {
+-            "": qdata,
+-            "_scale": params.scale,
++            "": stored_qdata,
++            "_scale": stored_scale,
+             "_proj_down": params.proj_down,
+             "_proj_up": params.proj_up,
+             "_smooth_factor": params.smooth_factor,
+         }
+ 
++    @classmethod
++    def normalize_device_storage(
++        cls,
++        qdata: torch.Tensor,
++        params: Params,
++        device: torch.device,
++    ) -> tuple[torch.Tensor, Params]:
++        if params.xpu_preconverted and device.type != "xpu":
++            qdata = (qdata.view(torch.uint8) ^ 0x88).view(torch.int8)
++            scale_dtype = params.xpu_scale_orig_dtype or params.orig_dtype
++            params = dataclasses.replace(
++                params,
++                scale=params.scale.to(scale_dtype),
++                xpu_preconverted=False,
++                xpu_scale_orig_dtype=None,
++            )
++        return qdata, params
++
++
++def prepare_svdquant_for_xpu(
++    weight: QuantizedTensor,
++    *,
++    destructive: bool = True,
++) -> QuantizedTensor:
++    """Destructively replace signed SVDQuant storage with oneDNN-ready storage.
++
++    Natural row-major INT4 weights are XOR-converted in place, so only the
++    small scale conversion is temporarily allocated. Tile-packed weights must
++    be prepared on CPU to avoid a full-size XPU reorder allocation.
++    """
++    if not isinstance(weight, QuantizedTensor) or (
++        weight._layout_cls != "TensorCoreSVDQuantW4A4Layout"
++    ):
++        raise TypeError("weight must use TensorCoreSVDQuantW4A4Layout")
++    if not destructive:
++        raise ValueError("only destructive preparation avoids duplicate weight storage")
++    params = weight._params
++    if params.xpu_preconverted:
++        return weight
++    if params.act_unsigned:
++        raise ValueError("omni preconverted GEMM does not support unsigned activations")
++    if params.transposed:
++        raise ValueError("prepare the physical SVDQuant weight before taking transpose views")
++
++    from comfy_kitchen.backends.xpu.svdquant import prepare_svdquant_weights
++
++    if weight._qdata.dim() == 4 and weight.device.type == "xpu":
++        raise RuntimeError(
++            "tile-packed weights must be prepared on CPU before upload to avoid "
++            "a full-size temporary XPU allocation"
++        )
++
++    qdata, scale, proj_up = prepare_svdquant_weights(weight._qdata, params.scale, params.proj_up)
++    qdata.view(torch.uint8).bitwise_xor_(0x88)
++    prepared_params = dataclasses.replace(
++        params,
++        scale=scale.to(torch.float16),
++        proj_up=proj_up,
++        xpu_preconverted=True,
++        xpu_scale_orig_dtype=scale.dtype,
++    )
++    object.__setattr__(weight, "_qdata", qdata)
++    object.__setattr__(weight, "_params", prepared_params)
++    return weight
++
++
++def restore_svdquant_standard_format_(weight: QuantizedTensor) -> QuantizedTensor:
++    """Restore prepared storage in place before memory-constrained serialization."""
++    if not isinstance(weight, QuantizedTensor) or (
++        weight._layout_cls != "TensorCoreSVDQuantW4A4Layout"
++    ):
++        raise TypeError("weight must use TensorCoreSVDQuantW4A4Layout")
++    params = weight._params
++    if not params.xpu_preconverted:
++        return weight
++    weight._qdata.view(torch.uint8).bitwise_xor_(0x88)
++    scale_dtype = params.xpu_scale_orig_dtype or params.orig_dtype
++    object.__setattr__(
++        weight,
++        "_params",
++        dataclasses.replace(
++            params,
++            scale=params.scale.to(scale_dtype),
++            xpu_preconverted=False,
++            xpu_scale_orig_dtype=None,
++        ),
++    )
++    return weight
++
+ 
+ # ==================== Linear Dispatch ====================
+ 
++
+ def _w4a4_forward(
+     input_tensor: torch.Tensor,
+     weight_qt: QuantizedTensor,
+@@ -469,7 +635,9 @@
+     Kernel API stays shift-free — shift is a Qwen/Flux model-topology constant,
+     not a quantize-op parameter.
+     """
+-    qdata, wscales, smooth, proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight_qt)
++    qdata, wscales, smooth, proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(
++        weight_qt
++    )
+     act_unsigned = bool(getattr(weight_qt._params, "act_unsigned", False))
+ 
+     orig_shape = input_tensor.shape
+@@ -478,13 +646,24 @@
+ 
+     if act_unsigned:
+         x_main = x2d + _GELU_UNSIGNED_SHIFT  # fed to quantize for unsigned grid
+-        lora_x = x2d                         # LoRA always sees raw x
++        lora_x = x2d  # LoRA always sees raw x
+     else:
+         x_main = x2d
+-        lora_x = None                        # wrapper will fall back to x_main
++        lora_x = None  # wrapper will fall back to x_main
+ 
+     cuda_backend = _direct_cuda_backend(x_main, qdata)
+-    if cuda_backend is not None:
++    if weight_qt._params.xpu_preconverted:
++        q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
++            x_main,
++            smooth=smooth,
++            lora_down=proj_down,
++            act_unsigned=False,
++            lora_x=lora_x,
++        )
++        out = _xpu_preconverted_mm(q_x, ascales, lora_act, weight_qt, bias)
++        if out is None:
++            raise RuntimeError("XPU-preconverted SVDQuant weight requires an XPU input")
++    elif cuda_backend is not None:
+         q_x, ascales, lora_act = cuda_backend.quantize_svdquant_w4a4(
+             x_main,
+             smooth=smooth,
+@@ -493,8 +672,13 @@
+             lora_x=lora_x,
+         )
+         out = cuda_backend.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
+-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=wscales,
++            lora_act_in=lora_act,
++            lora_up=proj_up,
++            bias=bias,
+             act_unsigned=act_unsigned,
+         )
+     else:
+@@ -506,8 +690,13 @@
+             lora_x=lora_x,
+         )
+         out = ck.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
+-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=wscales,
++            lora_act_in=lora_act,
++            lora_up=proj_up,
++            bias=bias,
+             act_unsigned=act_unsigned,
+         )
+     out_features = TensorCoreSVDQuantW4A4Layout.get_out_features_from_storage(qdata)

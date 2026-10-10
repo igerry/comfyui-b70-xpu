@@ -1,0 +1,381 @@
+--- tensor/svdquant_w4a4.py	2026-09-05 00:41:12.526011950 +0000
++++ tensor/svdquant_w4a4.py	2026-09-05 00:14:24.397802418 +0000
+@@ -16,6 +16,7 @@
+ that pure 4-bit quantization cannot represent; the dispatched kernel fuses
+ activation quantization + low-rank correction + int4 matmul into a single call.
+ """
++
+ from __future__ import annotations
+ 
+ import dataclasses
+@@ -88,6 +89,32 @@
+     return cuda_backend
+ 
+ 
++def _xpu_preconverted_mm(
++    q_x: torch.Tensor,
++    ascales: torch.Tensor,
++    lora_act: torch.Tensor,
++    weight_qt: QuantizedTensor,
++    bias: torch.Tensor | None,
++) -> torch.Tensor | None:
++    params = weight_qt._params
++    if not params.xpu_preconverted or q_x.device.type != "xpu":
++        return None
++    from comfy_kitchen.backends.xpu.svdquant import (
++        scaled_mm_svdquant_w4a4_preconverted,
++    )
++
++    return scaled_mm_svdquant_w4a4_preconverted(
++        q_x,
++        weight_qt._qdata,
++        ascales,
++        params.scale,
++        lora_act,
++        params.proj_up,
++        bias,
++        params.xpu_scale_orig_dtype or params.orig_dtype,
++    )
++
++
+ def _is_svdquant_w4a4_qtensor(tensor: torch.Tensor) -> bool:
+     return (
+         isinstance(tensor, QuantizedTensor)
+@@ -158,18 +185,33 @@
+     *,
+     m: int,
+ ) -> tuple[torch.Tensor, int]:
+-    qdata, wscales, _smooth, _proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight_qt)
++    qdata, wscales, _smooth, _proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(
++        weight_qt
++    )
+     act_unsigned = bool(getattr(weight_qt._params, "act_unsigned", False))
+-    if cuda_backend is not None:
++    out = _xpu_preconverted_mm(q_x, ascales, lora_act, weight_qt, bias)
++    if out is not None:
++        pass
++    elif cuda_backend is not None:
+         out = cuda_backend.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
+-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=wscales,
++            lora_act_in=lora_act,
++            lora_up=proj_up,
++            bias=bias,
+             act_unsigned=act_unsigned,
+         )
+     else:
+         out = ck.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
+-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=wscales,
++            lora_act_in=lora_act,
++            lora_up=proj_up,
++            bias=bias,
+             act_unsigned=act_unsigned,
+         )
+     out_features = TensorCoreSVDQuantW4A4Layout.get_out_features_from_storage(qdata)
+@@ -197,12 +239,16 @@
+     if len(biases) != len(weights):
+         raise ValueError(f"got {len(weights)} weights but {len(biases)} biases")
+     if not svdquant_w4a4_can_share_quant(
+-        weights, validate=validate_shared_quant, trust=assume_shared_quant,
++        weights,
++        validate=validate_shared_quant,
++        trust=assume_shared_quant,
+     ):
+         raise ValueError("SVDQuant weights do not share quantization parameters")
+ 
+     first = weights[0]
+-    qdata, _wscales, smooth, proj_down, _proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(first)
++    qdata, _wscales, smooth, proj_down, _proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(
++        first
++    )
+     act_unsigned = bool(getattr(first._params, "act_unsigned", False))
+ 
+     orig_shape = input_tensor.shape
+@@ -237,7 +283,13 @@
+     outputs = []
+     for weight, bias in zip(weights, biases, strict=True):
+         out2d, out_features = _w4a4_forward_from_quantized_activation(
+-            q_x, ascales, lora_act, weight, bias, cuda_backend, m=m,
++            q_x,
++            ascales,
++            lora_act,
++            weight,
++            bias,
++            cuda_backend,
++            m=m,
+         )
+         outputs.append(out2d.reshape(*orig_shape[:-1], out_features))
+     return tuple(outputs)
+@@ -272,7 +324,9 @@
+     if len(biases) != len(weights):
+         raise ValueError(f"got {len(weights)} weights but {len(biases)} biases")
+     if not svdquant_w4a4_can_share_quant(
+-        weights, validate=validate_shared_quant, trust=assume_shared_quant,
++        weights,
++        validate=validate_shared_quant,
++        trust=assume_shared_quant,
+     ):
+         raise ValueError("SVDQuant weights do not share quantization parameters")
+ 
+@@ -285,7 +339,11 @@
+     scales = []
+     proj_ups = []
+     for weight in weights:
+-        qdata, wscale, _smooth, _proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight)
++        if weight._params.xpu_preconverted != first_params.xpu_preconverted:
++            raise ValueError("cannot fuse mixed standard and XPU-preconverted weights")
++        qdata, wscale, _smooth, _proj_down, proj_up = (
++            TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight)
++        )
+         if weight._params.orig_shape[1] != in_features:
+             raise ValueError("all fused SVDQuant weights must have the same input features")
+         if bool(weight._params.act_unsigned) != act_unsigned:
+@@ -317,6 +375,8 @@
+         proj_up=fused_proj_up,
+         smooth_factor=first_params.smooth_factor,
+         act_unsigned=act_unsigned,
++        xpu_preconverted=bool(first_params.xpu_preconverted),
++        xpu_scale_orig_dtype=first_params.xpu_scale_orig_dtype,
+     )
+     return (
+         QuantizedTensor(fused_qdata, "TensorCoreSVDQuantW4A4Layout", params),
+@@ -369,11 +429,14 @@
+         low-rank correction and input smoothing, plus a logical-transpose flag
+         used by the aten.t / aten.mm dispatch path.
+         """
++
+         proj_down: torch.Tensor
+         proj_up: torch.Tensor
+         smooth_factor: torch.Tensor
+         act_unsigned: bool = False
+         transposed: bool = False
++        xpu_preconverted: bool = False
++        xpu_scale_orig_dtype: torch.dtype | None = None
+ 
+         def _tensor_fields(self) -> list[str]:
+             return ["scale", "proj_down", "proj_up", "smooth_factor"]
+@@ -412,17 +475,25 @@
+ 
+         eye = torch.eye(in_features, dtype=dtype, device=device)
+         q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
+-            eye, smooth=params.smooth_factor, lora_down=params.proj_down,
++            eye,
++            smooth=params.smooth_factor,
++            lora_down=params.proj_down,
+         )
+         w_eff = ck.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=params.scale,
+-            lora_act_in=lora_act, lora_up=params.proj_up, bias=None,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=params.scale,
++            lora_act_in=lora_act,
++            lora_up=params.proj_up,
++            bias=None,
+         )[:in_features]
+         return w_eff.t().contiguous()
+ 
+     @classmethod
+     def get_plain_tensors(
+-        cls, qtensor: QuantizedTensor,
++        cls,
++        qtensor: QuantizedTensor,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         p = qtensor._params
+         return qtensor._qdata, p.scale, p.smooth_factor, p.proj_down, p.proj_up
+@@ -441,17 +512,112 @@
+         producing for example `transformer_blocks.0.attn.to_q.weight`,
+         `...weight_scale`, `...weight_proj_down`, etc.
+         """
++        stored_qdata = qdata
++        stored_scale = params.scale
++        if params.xpu_preconverted:
++            stored_qdata = (qdata.view(torch.uint8) ^ 0x88).view(torch.int8)
++            stored_scale = params.scale.to(params.xpu_scale_orig_dtype or params.orig_dtype)
+         return {
+-            "": qdata,
+-            "_scale": params.scale,
++            "": stored_qdata,
++            "_scale": stored_scale,
+             "_proj_down": params.proj_down,
+             "_proj_up": params.proj_up,
+             "_smooth_factor": params.smooth_factor,
+         }
+ 
++    @classmethod
++    def normalize_device_storage(
++        cls,
++        qdata: torch.Tensor,
++        params: Params,
++        device: torch.device,
++    ) -> tuple[torch.Tensor, Params]:
++        if params.xpu_preconverted and device.type != "xpu":
++            qdata = (qdata.view(torch.uint8) ^ 0x88).view(torch.int8)
++            scale_dtype = params.xpu_scale_orig_dtype or params.orig_dtype
++            params = dataclasses.replace(
++                params,
++                scale=params.scale.to(scale_dtype),
++                xpu_preconverted=False,
++                xpu_scale_orig_dtype=None,
++            )
++        return qdata, params
++
++
++def prepare_svdquant_for_xpu(
++    weight: QuantizedTensor,
++    *,
++    destructive: bool = True,
++) -> QuantizedTensor:
++    """Destructively replace signed SVDQuant storage with oneDNN-ready storage.
++
++    Natural row-major INT4 weights are XOR-converted in place, so only the
++    small scale conversion is temporarily allocated. Tile-packed weights must
++    be prepared on CPU to avoid a full-size XPU reorder allocation.
++    """
++    if not isinstance(weight, QuantizedTensor) or (
++        weight._layout_cls != "TensorCoreSVDQuantW4A4Layout"
++    ):
++        raise TypeError("weight must use TensorCoreSVDQuantW4A4Layout")
++    if not destructive:
++        raise ValueError("only destructive preparation avoids duplicate weight storage")
++    params = weight._params
++    if params.xpu_preconverted:
++        return weight
++    if params.act_unsigned:
++        raise ValueError("omni preconverted GEMM does not support unsigned activations")
++    if params.transposed:
++        raise ValueError("prepare the physical SVDQuant weight before taking transpose views")
++
++    from comfy_kitchen.backends.xpu.svdquant import prepare_svdquant_weights
++
++    if weight._qdata.dim() == 4 and weight.device.type == "xpu":
++        raise RuntimeError(
++            "tile-packed weights must be prepared on CPU before upload to avoid "
++            "a full-size temporary XPU allocation"
++        )
++
++    qdata, scale, proj_up = prepare_svdquant_weights(weight._qdata, params.scale, params.proj_up)
++    qdata.view(torch.uint8).bitwise_xor_(0x88)
++    prepared_params = dataclasses.replace(
++        params,
++        scale=scale.to(torch.float16),
++        proj_up=proj_up,
++        xpu_preconverted=True,
++        xpu_scale_orig_dtype=scale.dtype,
++    )
++    object.__setattr__(weight, "_qdata", qdata)
++    object.__setattr__(weight, "_params", prepared_params)
++    return weight
++
++
++def restore_svdquant_standard_format_(weight: QuantizedTensor) -> QuantizedTensor:
++    """Restore prepared storage in place before memory-constrained serialization."""
++    if not isinstance(weight, QuantizedTensor) or (
++        weight._layout_cls != "TensorCoreSVDQuantW4A4Layout"
++    ):
++        raise TypeError("weight must use TensorCoreSVDQuantW4A4Layout")
++    params = weight._params
++    if not params.xpu_preconverted:
++        return weight
++    weight._qdata.view(torch.uint8).bitwise_xor_(0x88)
++    scale_dtype = params.xpu_scale_orig_dtype or params.orig_dtype
++    object.__setattr__(
++        weight,
++        "_params",
++        dataclasses.replace(
++            params,
++            scale=params.scale.to(scale_dtype),
++            xpu_preconverted=False,
++            xpu_scale_orig_dtype=None,
++        ),
++    )
++    return weight
++
+ 
+ # ==================== Linear Dispatch ====================
+ 
++
+ def _w4a4_forward(
+     input_tensor: torch.Tensor,
+     weight_qt: QuantizedTensor,
+@@ -469,7 +635,9 @@
+     Kernel API stays shift-free — shift is a Qwen/Flux model-topology constant,
+     not a quantize-op parameter.
+     """
+-    qdata, wscales, smooth, proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(weight_qt)
++    qdata, wscales, smooth, proj_down, proj_up = TensorCoreSVDQuantW4A4Layout.get_plain_tensors(
++        weight_qt
++    )
+     act_unsigned = bool(getattr(weight_qt._params, "act_unsigned", False))
+ 
+     orig_shape = input_tensor.shape
+@@ -478,13 +646,24 @@
+ 
+     if act_unsigned:
+         x_main = x2d + _GELU_UNSIGNED_SHIFT  # fed to quantize for unsigned grid
+-        lora_x = x2d                         # LoRA always sees raw x
++        lora_x = x2d  # LoRA always sees raw x
+     else:
+         x_main = x2d
+-        lora_x = None                        # wrapper will fall back to x_main
++        lora_x = None  # wrapper will fall back to x_main
+ 
+     cuda_backend = _direct_cuda_backend(x_main, qdata)
+-    if cuda_backend is not None:
++    if weight_qt._params.xpu_preconverted:
++        q_x, ascales, lora_act = ck.quantize_svdquant_w4a4(
++            x_main,
++            smooth=smooth,
++            lora_down=proj_down,
++            act_unsigned=False,
++            lora_x=lora_x,
++        )
++        out = _xpu_preconverted_mm(q_x, ascales, lora_act, weight_qt, bias)
++        if out is None:
++            raise RuntimeError("XPU-preconverted SVDQuant weight requires an XPU input")
++    elif cuda_backend is not None:
+         q_x, ascales, lora_act = cuda_backend.quantize_svdquant_w4a4(
+             x_main,
+             smooth=smooth,
+@@ -493,8 +672,13 @@
+             lora_x=lora_x,
+         )
+         out = cuda_backend.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
+-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=wscales,
++            lora_act_in=lora_act,
++            lora_up=proj_up,
++            bias=bias,
+             act_unsigned=act_unsigned,
+         )
+     else:
+@@ -506,8 +690,13 @@
+             lora_x=lora_x,
+         )
+         out = ck.scaled_mm_svdquant_w4a4(
+-            act=q_x, wgt=qdata, ascales=ascales, wscales=wscales,
+-            lora_act_in=lora_act, lora_up=proj_up, bias=bias,
++            act=q_x,
++            wgt=qdata,
++            ascales=ascales,
++            wscales=wscales,
++            lora_act_in=lora_act,
++            lora_up=proj_up,
++            bias=bias,
+             act_unsigned=act_unsigned,
+         )
+     out_features = TensorCoreSVDQuantW4A4Layout.get_out_features_from_storage(qdata)

@@ -1,0 +1,816 @@
+/***************************************************************************************************
+ * Torch-callable wrapper around the cute_attn_analysis fused FMHA (example-06 kernel).
+ *
+ * Exposes cute_fmha::sdp(q, k, v) -> o with the SAME signature/layout as
+ * omni_xpu_kernel.sdp: q,k,v,o are [B, L, H, D] (B==1, D==128), fp16 or bf16,
+ * XPU. PTL-H and BMG builds additionally expose a dense-BHLD D120 entry point
+ * used by the validated ComfyUI workflow route.
+ *
+ * The kernel body is the CUTLASS-SYCL flash-attention-v2 forward used by
+ * 06_xe_fmha_fwd.cpp (d=128, platform-selected tile/GRF/pipeline policy).
+ * The initial PTL-H policy uses the correctness-validated BMG values; only the launch is changed:
+ * instead of cutlass' global compat queue we submit onto torch's current XPU
+ * queue (at::xpu::getCurrentXPUStream().queue()), with torch tensor data_ptr()s
+ * as the operands, so the SYCL context matches torch's allocations.
+ *
+ * Launch glue pattern copied from sgl-kernel-xpu src/sycl/comm/common.h.
+ **************************************************************************************************/
+// phase-3c: lazy online-softmax rescale on by default for BMG (bitwise identical, -1.9% on H3 DiT).
+#if defined(OMNI_XPU_ARCH_BMG) && !defined(CUTE_FMHA_LAZY_RESCALE)
+#define CUTE_FMHA_LAZY_RESCALE 1
+#endif
+#include <ATen/ATen.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/all.h>
+#include <torch/library.h>
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
+
+#include <cute/tensor.hpp>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+#include "cutlass/cutlass.h"
+#include "cutlass/kernel_hardware_info.h"
+#include "cutlass/util/packed_stride.hpp"
+#include "cutlass/device_kernel.h"
+#include "cute/util/compat.hpp"
+
+#include "flash_attention_v2/collective/fmha_fusion.hpp"
+#include "flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp"
+#include "flash_attention_v2/collective/xe_fmha_fwd_epilogue.hpp"
+#include "flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
+#include "flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#if defined(OMNI_XPU_ARCH_BMG)
+#include "../csrc/bmg_kernel_policy.h"
+#include "../csrc/device_utils.h"
+#endif
+#include "cute_fmha_config.h"
+
+using namespace cute;
+
+namespace {
+
+// ---- launch glue: submit cutlass device kernel onto torch's XPU queue --------
+// (mirror of sgl-kernel-xpu src/sycl/comm/common.h::launch)
+template <typename Kernel, int GrfSize>
+class CuteFmhaKernelTag {};
+
+template <typename Kernel, int GrfSize = 256>
+static void launch_on_torch_queue(typename Kernel::Params params) {
+  static_assert(GrfSize == 128 || GrfSize == 256, "GRF size must be 128 or 256");
+
+  compat::dim3 const block = Kernel::get_block_shape();
+  compat::dim3 const grid = Kernel::get_grid_shape(params);
+  int smem_size = Kernel::SharedStorageSize;
+
+  const auto sycl_block = compat::dim3(block.x, block.y, block.z);
+  const auto sycl_grid = compat::dim3(grid.x, grid.y, grid.z);
+
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+
+  compat::experimental::launch_properties launch_props{
+      syclex::work_group_scratch_size(smem_size),
+  };
+  compat::experimental::kernel_properties kernel_props{
+      syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<GrfSize>};
+  compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
+
+  syclex::launch_config config(policy.get_range(), policy.get_launch_properties());
+  auto cgf = [&](::sycl::handler& cgh) {
+    auto KernelFunctor =
+        compat::experimental::detail::build_kernel_functor<cutlass::device_kernel<Kernel>>(cgh, policy, params);
+    syclex::detail::LaunchConfigAccess<sycl::nd_range<3>, decltype(policy.get_launch_properties())>
+        ConfigAccess(config);
+    cgh.parallel_for<CuteFmhaKernelTag<Kernel, GrfSize>>(
+        ConfigAccess.getRange(), ConfigAccess.getProperties(), KernelFunctor);
+  };
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto q = stream.queue();
+  q.submit(cgf);
+}
+
+static int checked_int(int64_t value, const char* label) {
+  TORCH_CHECK(
+      value >= 0 && value <= std::numeric_limits<int>::max(), label,
+      " exceeds the CUTE int32 index range: ", value);
+  return static_cast<int>(value);
+}
+
+// ---- kernel type assembly (128-wide tile, example-06 PREFILL path) ----------
+// KV tile = get<1>(ShapeQK). Default 32 (stock example-06). -DCUTE_FMHA_KV64
+// switches to a 64-wide KV tile (fewer K-loop iters at large seq — omni uses 64).
+template <
+    typename Element,
+    int PipelineStagesOverride = 0,
+    int QTileOverride = 0,
+    int SubgroupLayoutQOverride = 0,
+    int MmaKOverride = 0,
+    int VTileOverride = 0,
+    int HeadDimOverride = 0,
+    int KvTileOverride = 0,
+    bool StaticHeadDim = false,   // phase-3b: Int<HeadDim> in the tensor shapes
+    int SubgroupLayoutNOverride = 0>  // phase-8: subgroups along KV
+struct D128TileKernel {
+  using PlatformConfig = cute_fmha_config::ActiveConfig;
+  static constexpr int QTile =
+      QTileOverride > 0 ? QTileOverride : PlatformConfig::Q_TILE;
+  static constexpr int SubgroupLayoutQ =
+      SubgroupLayoutQOverride > 0
+          ? SubgroupLayoutQOverride
+          : PlatformConfig::SUBGROUP_LAYOUT_Q;
+  static constexpr int MmaK =
+      MmaKOverride > 0 ? MmaKOverride : PlatformConfig::MMA_K;
+  static constexpr int VTile =
+      VTileOverride > 0 ? VTileOverride : PlatformConfig::V_TILE;
+  static constexpr int HeadDim =
+      HeadDimOverride > 0 ? HeadDimOverride : PlatformConfig::HEAD_DIM;
+#if defined(CUTE_FMHA_KV64)
+  // KV tile = get<1>(ShapeQK) = 64. Per get_tiled_mma_pv, the PV tile must be
+  // <TileQ, TileV, KVtile> — so ShapePV's K-dim (3rd) MUST equal 64, not 32.
+  // TileV=32 -> VTiles = 128/32 = 4. (My earlier <256,32,32> broke the QK->PV
+  // K-dim match and tripped the gemm.hpp static_assert.)
+  static constexpr int KvTileDefault = 64;
+#else
+  static constexpr int KvTileDefault = PlatformConfig::KV_TILE;
+#endif
+  // Per-route override (B70: KV64 loses 8% on the DiT d128 route but wins 18%
+  // together with 3 stages on the VAE d64 route).
+  static constexpr int KvTile =
+      KvTileOverride > 0 ? KvTileOverride : KvTileDefault;
+  using ShapeQK = Shape<
+      Int<QTile>, Int<KvTile>, Int<MmaK>>;
+  using ShapePV = Shape<
+      Int<QTile>, Int<VTile>, Int<KvTile>>;
+  using ShapeOutput = Shape<
+      Int<QTile>, Int<HeadDim>>;
+  // phase-8: <Q, KV, 1>. An N > 1 splits the KV tile between subgroups, which turns into a
+  // split of the P*V contraction (get_sg_layout_pv) and is reduced in the epilogue (ReduceK).
+  static constexpr int SubgroupLayoutN =
+      SubgroupLayoutNOverride > 0 ? SubgroupLayoutNOverride : 1;
+  using SubgroupLayoutQK = Layout<
+      Shape<Int<SubgroupLayoutQ>, Int<SubgroupLayoutN>, _1>>;
+  static_assert(SubgroupLayoutQ * SubgroupLayoutN * 16 <= 512,
+                "cute_fmha: workgroup exceeds 512 work-items at 256 GRF");
+#ifdef CUTE_FMHA_STAGES
+  static constexpr int PipelineStages = CUTE_FMHA_STAGES;
+#else
+  static constexpr int PipelineStages =
+      PipelineStagesOverride > 0 ? PipelineStagesOverride
+                                 : PlatformConfig::PIPELINE_STAGES;
+#endif
+#ifdef CUTE_FMHA_GRF
+  static constexpr int GrfSize = CUTE_FMHA_GRF;   // phase-3a variant sweep
+#else
+  static constexpr int GrfSize = PlatformConfig::GRF_SIZE;
+#endif
+
+  using ElementQ = Element;
+  using ElementK = Element;
+  using ElementV = Element;
+  using ElementO = Element;   // output dtype == input dtype (fp16/bf16)
+
+  using StrideQ = Stride<int, _1, int, int>;
+#if defined(CUTE_FMHA_DIAG_K_AS_V) && CUTE_FMHA_DIAG_K_AS_V
+  /* phase-5 timing probe: pretend K's sequence mode is the contiguous one, the way V's is, so
+     make_block_2d_copy_B emits the VNNI load (d16v) instead of the transposing load (d32t).
+     The kernel then reads the wrong elements — use only to price a pre-transposed K. */
+  using StrideK = Stride<_1, int, int, int>;
+#else
+  using StrideK = Stride<int, _1, int, int>;
+#endif
+  using StrideV = Stride<_1, int, int, int>;
+  using StrideO = Stride<int, _1, int, int>;
+
+  static constexpr int SGTileQ =
+      get<0>(shape_div(ShapeQK{}, shape(SubgroupLayoutQK{})))();
+  using MMAOperation = XE_DPAS_TT<cute::gcd(SGTileQ, 8), float, Element>;
+  using SubgroupLayoutPV =
+      decltype(cutlass::fmha::collective::get_sg_layout_pv(SubgroupLayoutQK{}));
+
+  using TiledMMAQK =
+      typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<ShapeQK>, SubgroupLayoutQK>::TiledMMA;
+  using TiledMMAPV =
+      typename TiledMMAHelper<MMA_Atom<MMAOperation>, Layout<ShapePV>, SubgroupLayoutPV>::TiledMMA;
+  static constexpr int VTiles = get<1>(ShapeOutput{}) / get<1>(ShapePV{});
+
+  static auto make_dummy(Element v, StrideQ s) {
+    return make_tensor(make_gmem_ptr(&v), make_layout(repeat<rank_v<StrideQ>>(1), s));
+  }
+  // phase-3b: with StaticHeadDim the head-dim mode is Int<HeadDim>, so every
+  // head-dim chunk loop in the mainloop has a static trip count.
+  using HD = std::conditional_t<StaticHeadDim, Int<HeadDim>, int>;
+  using ShapeQKO = Shape<int, HD, int, int>;
+  using ShapeVT  = Shape<HD, int, int, int>;
+  using TensorQ = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+                            make_layout(ShapeQKO{}, StrideQ{})));
+  using TensorK = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+                            make_layout(ShapeQKO{}, StrideK{})));
+  using TensorV = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+                            make_layout(ShapeVT{}, StrideV{})));
+  using TensorO = decltype(make_tensor(make_gmem_ptr((Element*)nullptr),
+                            make_layout(ShapeQKO{}, StrideO{})));
+  using TensorK_cache = TensorK;
+  using TensorV_cache = TensorV;
+
+  using MainloopDispatchPolicy = cutlass::fmha::XeDefault<PipelineStages>;
+  using CollectiveMainloop = cutlass::fmha::collective::FMHAFwdMainloop<
+      MainloopDispatchPolicy, /*Causal=*/false, /*CachedKV=*/false, /*PagedKV=*/false,
+      TiledMMAQK, TiledMMAPV, VTiles,
+      TensorQ, TensorK, TensorV, TensorK_cache, TensorV_cache,
+      void, void, void, void, void>;
+
+  using CollectiveEpilogue = cutlass::fmha::collective::FMHAFwdEpilogue<
+      CollectiveMainloop, ShapeOutput, TensorO, void>;
+
+  using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<false>;
+  using Kernel = cutlass::fmha::kernel::XeFMHAFwdKernel<
+      ProblemShapeType, CollectiveMainloop, CollectiveEpilogue,
+      cutlass::fmha::kernel::XeFHMAIndividualTileScheduler>;
+};
+
+template <
+    typename Element,
+    int PipelineStagesOverride = 0,
+    int QTileOverride = 0,
+    int SubgroupLayoutQOverride = 0,
+    int MmaKOverride = 0,
+    int VTileOverride = 0,
+    int HeadDimOverride = 0,
+    int KvTileOverride = 0,
+    bool StaticHeadDim = false,
+    int SubgroupLayoutNOverride = 0>
+void run_d128_tile(
+    const void* q_ptr, const void* k_ptr, const void* v_ptr, void* o_ptr,
+    int B, int H, int Lq, int Lkv, int D, float scale,
+    int64_t q_stride_seq = -1, int64_t q_stride_head = -1,
+    int64_t q_stride_batch = -1, int64_t k_stride_seq = -1,
+    int64_t k_stride_head = -1, int64_t k_stride_batch = -1,
+    int64_t v_stride_seq = -1, int64_t v_stride_head = -1,
+    int64_t v_stride_batch = -1, int64_t o_stride_seq = -1,
+    int64_t o_stride_head = -1, int64_t o_stride_batch = -1) {
+  using KT = D128TileKernel<
+      Element,
+      PipelineStagesOverride,
+      QTileOverride,
+      SubgroupLayoutQOverride,
+      MmaKOverride,
+      VTileOverride,
+      HeadDimOverride,
+      KvTileOverride,
+      StaticHeadDim,
+      SubgroupLayoutNOverride>;
+  using K    = typename KT::Kernel;
+  if constexpr (StaticHeadDim) {
+    TORCH_CHECK(D == KT::HeadDim, "cute_fmha: static head-dim route requires D == ", KT::HeadDim);
+  }
+  using PS   = typename KT::ProblemShapeType;
+
+  cutlass::KernelHardwareInfo hw_info;
+  // Queried once: two get_info calls per attention call otherwise, and the
+  // individual tile scheduler ignores sm_count anyway.
+  static const int cached_sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+          hw_info.device_id);
+  hw_info.sm_count = cached_sm_count;
+
+  PS shape;
+  shape.batch = B;
+  shape.num_heads_q = H;
+  shape.num_heads_kv = H;
+  shape.seq_len_qo = Lq;   // cross-attention: Lq may differ from Lkv
+  shape.seq_len_kv = Lkv;
+  shape.seq_len_kv_cache = 0;
+  shape.head_size_qk = D;
+  shape.head_size_vo = D;
+
+  // Logical cute modes are Q/K/O=(seq,dim,head,batch) and
+  // V=(dim,seq,head,batch). Default strides consume contiguous BLHD. The D120
+  // entry point supplies the actual dense BHLD/BLHD-backed strides so it can
+  // match ComfyUI's mixed input layouts without materializing copies.
+  const int HD = checked_int(static_cast<int64_t>(H) * D, "H*D");
+  const int LqHD = checked_int(static_cast<int64_t>(Lq) * H * D, "Lq*H*D");
+  const int LkvHD = checked_int(static_cast<int64_t>(Lkv) * H * D, "Lkv*H*D");
+  if (q_stride_seq < 0) {
+    q_stride_seq = HD;
+    q_stride_head = D;
+    q_stride_batch = LqHD;
+    k_stride_seq = HD;
+    k_stride_head = D;
+    k_stride_batch = LkvHD;
+    v_stride_seq = HD;
+    v_stride_head = D;
+    v_stride_batch = LkvHD;
+    o_stride_seq = HD;
+    o_stride_head = D;
+    o_stride_batch = LqHD;
+  }
+  typename KT::StrideQ stride_Q =
+      cute::make_stride(
+          checked_int(q_stride_seq, "Q sequence stride"), _1{},
+          checked_int(q_stride_head, "Q head stride"),
+          checked_int(q_stride_batch, "Q batch stride"));
+#if defined(CUTE_FMHA_DIAG_K_AS_V) && CUTE_FMHA_DIAG_K_AS_V
+  typename KT::StrideK stride_K =
+      cute::make_stride(
+          _1{}, checked_int(k_stride_seq, "K sequence stride"),
+          checked_int(k_stride_head, "K head stride"),
+          checked_int(k_stride_batch, "K batch stride"));
+#else
+  typename KT::StrideK stride_K =
+      cute::make_stride(
+          checked_int(k_stride_seq, "K sequence stride"), _1{},
+          checked_int(k_stride_head, "K head stride"),
+          checked_int(k_stride_batch, "K batch stride"));
+#endif
+  typename KT::StrideV stride_V =
+      cute::make_stride(
+          _1{}, checked_int(v_stride_seq, "V sequence stride"),
+          checked_int(v_stride_head, "V head stride"),
+          checked_int(v_stride_batch, "V batch stride"));
+  typename KT::StrideO stride_O =
+      cute::make_stride(
+          checked_int(o_stride_seq, "output sequence stride"), _1{},
+          checked_int(o_stride_head, "output head stride"),
+          checked_int(o_stride_batch, "output batch stride"));
+
+  typename K::Arguments arguments{
+      {
+          shape,
+          static_cast<const Element*>(q_ptr), stride_Q,
+          static_cast<const Element*>(k_ptr), stride_K,
+          static_cast<const Element*>(v_ptr), stride_V,
+          static_cast<Element*>(o_ptr),       stride_O,
+          nullptr, stride_K,   // k_cache
+          nullptr, stride_V,   // v_cache
+      },
+      {scale, nullptr, 0, nullptr},
+      {},
+      hw_info};
+
+  size_t workspace_size = K::get_workspace_size(arguments);
+  at::Tensor workspace;
+  if (workspace_size > 0) {
+    auto opts = at::TensorOptions().dtype(at::kByte).device(at::kXPU);
+    workspace = at::empty({(long)workspace_size}, opts);
+  }
+
+  TORCH_CHECK(K::can_implement(arguments),
+              "cute_fmha: can_implement failed (bad problem shape)");
+  void* workspace_ptr = workspace.defined() ? workspace.data_ptr() : nullptr;
+  K::initialize_workspace(arguments, workspace_ptr);
+  auto kernel_params = K::to_underlying_arguments(arguments, workspace_ptr);
+  launch_on_torch_queue<K, KT::GrfSize>(kernel_params);
+}
+
+// ---- public op --------------------------------------------------------------
+at::Tensor sdp(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "cute_fmha: expect [B,L,H,D]");
+  // All three operands must be on XPU and share q's dtype — the kernel takes raw
+  // data_ptr()s and reinterprets them as q's element type, so a CPU tensor or a
+  // dtype mismatch would feed invalid pointers / misread data.
+  TORCH_CHECK(q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
+              "cute_fmha: q, k, v must all be XPU tensors (got ",
+              q.device(), ", ", k.device(), ", ", v.device(), ")");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+              "cute_fmha: q, k, v must share dtype (got ",
+              q.scalar_type(), ", ", k.scalar_type(), ", ", v.scalar_type(), ")");
+  // Public layout is [B, L, H, D] (drop-in for omni_xpu_kernel.sdp). The kernel
+  // reads this contiguous layout directly via custom strides (run_d128_tile), so no
+  // permute/copy is needed — output is also [B, L, H, D].
+  // q,k,v are [B, L, H, D]. The current scheduler is validated only for
+  // self-attention; reject cross-attention instead of returning silently
+  // inaccurate results. ComfyUI routes cross-attention to the ESIMD backend.
+  const int B = checked_int(q.size(0), "batch");
+  const int Lq = checked_int(q.size(1), "query length");
+  const int H = checked_int(q.size(2), "head count");
+  const int D = checked_int(q.size(3), "head dimension");
+  const int Lkv = checked_int(k.size(1), "key/value length");
+  TORCH_CHECK(B == 1, "cute_fmha: only B==1 supported (got ", B, ")");
+  TORCH_CHECK(D == 128, "cute_fmha: only head_dim==128 supported (got ", D, ")");
+  TORCH_CHECK(Lq == Lkv,
+              "cute_fmha: only self-attention with equal q/kv lengths is supported (got ",
+              Lq, " and ", Lkv, ")");
+  TORCH_CHECK(k.size(0) == B && v.size(0) == B, "cute_fmha: batch mismatch");
+  TORCH_CHECK(k.size(2) == H && v.size(2) == H,
+              "cute_fmha: q,k,v must share num_heads (got ", H, ",",
+              k.size(2), ",", v.size(2), ")");
+  TORCH_CHECK(k.size(3) == D && v.size(3) == D,
+              "cute_fmha: q,k,v must share head_dim");
+  TORCH_CHECK(v.size(1) == Lkv,
+              "cute_fmha: k,v seq_len must match (got ", Lkv, ",",
+              v.size(1), ")");
+
+  auto qc = q.contiguous(), kc = k.contiguous(), vc = v.contiguous();
+  at::Tensor o = at::empty_like(qc);
+  const float scale = 1.0f / std::sqrt((float)D);
+
+  if (q.scalar_type() == at::kHalf) {
+    run_d128_tile<cutlass::half_t>(
+        qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
+        Lkv, D, scale);
+  } else if (q.scalar_type() == at::kBFloat16) {
+#if defined(OMNI_XPU_ARCH_BMG)
+    // Z-Image Turbo's canonical 1024x1024 workflow uses this exact self-
+    // attention contract.  On BMG, MMA-K16 reduces both forward and reverse
+    // publication micro time while Krea2 L4192/H48 remains fastest at the
+    // platform-default MMA-K32.  Keep the override exact instead of changing
+    // the platform-wide D128 policy.
+    if (Lq == 4128 && H == 30) {
+      run_d128_tile<cutlass::bfloat16_t, 0, 0, 0, 16>(
+          qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
+          Lkv, D, scale);
+      return o;
+    }
+#endif
+    run_d128_tile<cutlass::bfloat16_t>(
+        qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), o.data_ptr(), B, H, Lq,
+        Lkv, D, scale);
+  } else {
+    TORCH_CHECK(false, "cute_fmha: only fp16/bf16 supported");
+  }
+  return o;
+}
+
+#if defined(OMNI_XPU_ARCH_BMG)
+at::Tensor sdp_wan22_cross(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v) {
+  TORCH_CHECK(
+      q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+      "cute_fmha: Wan 2.2 cross attention expects [B,L,H,D]");
+  TORCH_CHECK(
+      q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
+      "cute_fmha: Wan 2.2 cross attention requires XPU tensors");
+  TORCH_CHECK(
+      q.scalar_type() == at::kHalf &&
+          k.scalar_type() == at::kHalf &&
+          v.scalar_type() == at::kHalf,
+      "cute_fmha: Wan 2.2 cross attention requires FP16 Q/K/V");
+  TORCH_CHECK(
+      q.sizes() == at::IntArrayRef({1, 75600, 40, 128}),
+      "cute_fmha: unsupported Wan 2.2 query shape ", q.sizes());
+  TORCH_CHECK(
+      k.sizes() == at::IntArrayRef({1, 512, 40, 128}) &&
+          v.sizes() == k.sizes(),
+      "cute_fmha: unsupported Wan 2.2 key/value shapes ",
+      k.sizes(), " and ", v.sizes());
+
+  auto qc = q.contiguous();
+  auto kc = k.contiguous();
+  auto vc = v.contiguous();
+  auto output = at::empty_like(qc);
+  constexpr int B = 1;
+  constexpr int Lq = 75600;
+  constexpr int Lkv = 512;
+  constexpr int H = 40;
+  constexpr int D = 128;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  run_d128_tile<cutlass::half_t, 0, 0, 0, 16>(
+      qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), output.data_ptr(),
+      B, H, Lq, Lkv, D, scale);
+  return output;
+}
+#endif
+
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+bool is_minimax_h3_h56_tensor_layout(
+    const at::Tensor& tensor, int64_t B, int64_t H, int64_t D) {
+  return B == 1 && H == 56 && D == 128 && tensor.stride(0) > 0 &&
+      tensor.stride(1) == D &&
+      (tensor.stride(2) == H * D || tensor.stride(2) == 3 * H * D) &&
+      tensor.stride(3) == 1;
+}
+
+bool is_supported_bhld_layout(
+    const at::Tensor& tensor, int64_t B, int64_t H, int64_t L, int64_t D) {
+  if (tensor.stride(3) != 1) {
+    return false;
+  }
+  const bool dense_batch_stride = tensor.stride(0) == H * L * D;
+  const bool packed_bhld =
+      tensor.stride(1) == L * D && tensor.stride(2) == D;
+  const bool blhd_backed =
+      tensor.stride(1) == D && tensor.stride(2) == H * D;
+  const bool minimax_h3_qkv_backed =
+      is_minimax_h3_h56_tensor_layout(tensor, B, H, D);
+  return (dense_batch_stride && (packed_bhld || blhd_backed)) ||
+      minimax_h3_qkv_backed;
+}
+
+#if defined(OMNI_XPU_ARCH_BMG)
+bool use_minimax_h3_h56_mmak16(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    int64_t B, int64_t H, int64_t Lq, int64_t Lkv, int64_t D) {
+  if (Lq != Lkv ||
+      !is_minimax_h3_h56_tensor_layout(q, B, H, D) ||
+      !is_minimax_h3_h56_tensor_layout(k, B, H, D) ||
+      !is_minimax_h3_h56_tensor_layout(v, B, H, D)) {
+    return false;
+  }
+
+  // Dense BLHD-backed H56 tensors also satisfy the accepted layout contract.
+  // Select the MiniMax-specific tile only when at least one operand still
+  // carries the interleaved QKV backing stride.  This covers the main H3
+  // Q/K/V views and the token-refiner mixed layout without changing the
+  // platform-wide policy for unrelated dense H56 attention.
+  const int64_t qkv_sequence_stride = 3 * H * D;
+  return q.stride(2) == qkv_sequence_stride ||
+      k.stride(2) == qkv_sequence_stride ||
+      v.stride(2) == qkv_sequence_stride;
+}
+
+at::Tensor sdp_bhld_d128(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  TORCH_CHECK(
+      q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+      "cute_fmha: D128 attention expects BHLD tensors");
+  TORCH_CHECK(
+      q.device().is_xpu() && k.device() == q.device() && v.device() == q.device(),
+      "cute_fmha: D128 attention requires Q/K/V on the same XPU device");
+  TORCH_CHECK(
+      k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+      "cute_fmha: D128 attention requires matching Q/K/V dtypes");
+
+  const int B = checked_int(q.size(0), "batch");
+  const int H = checked_int(q.size(1), "head count");
+  const int Lq = checked_int(q.size(2), "query length");
+  const int D = checked_int(q.size(3), "head dimension");
+  const int Lkv = checked_int(k.size(2), "key/value length");
+  TORCH_CHECK(
+      B > 0 && H > 0 && Lq > 0 && Lkv > 0,
+      "cute_fmha: D128 attention dimensions must be positive");
+  TORCH_CHECK(D == 128, "cute_fmha: D128 attention requires head_dim==128");
+  TORCH_CHECK(
+      k.sizes() == at::IntArrayRef({B, H, Lkv, D}) &&
+          v.sizes() == k.sizes(),
+      "cute_fmha: D128 attention requires matching B/H/D and K/V lengths (got ",
+      k.sizes(), " and ", v.sizes());
+  TORCH_CHECK(
+      is_supported_bhld_layout(q, B, H, Lq, D) &&
+          is_supported_bhld_layout(k, B, H, Lkv, D) &&
+          is_supported_bhld_layout(v, B, H, Lkv, D),
+      "cute_fmha: D128 attention requires dense packed-BHLD or "
+      "BLHD-backed tensors, or the B1/H56 MiniMax H3 QKV layout");
+
+  const bool q_is_packed_bhld =
+      q.stride(1) == static_cast<int64_t>(Lq) * D &&
+      q.stride(2) == D;
+  at::Tensor output =
+      q_is_packed_bhld
+          ? at::empty(q.sizes(), q.options())
+          : at::empty({B, Lq, H, D}, q.options()).permute({0, 2, 1, 3});
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  if (q.scalar_type() == at::kHalf) {
+    run_d128_tile<cutlass::half_t>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
+        B, H, Lq, Lkv, D, scale,
+        q.stride(2), q.stride(1), q.stride(0),
+        k.stride(2), k.stride(1), k.stride(0),
+        v.stride(2), v.stride(1), v.stride(0),
+        output.stride(2), output.stride(1), output.stride(0));
+  } else if (q.scalar_type() == at::kBFloat16) {
+    if (use_minimax_h3_h56_mmak16(q, k, v, B, H, Lq, Lkv, D)) {
+#ifndef CUTE_FMHA_DIT_STAGES
+#define CUTE_FMHA_DIT_STAGES 0
+#endif
+#ifndef CUTE_FMHA_DIT_QTILE
+#define CUTE_FMHA_DIT_QTILE 0
+#endif
+#ifndef CUTE_FMHA_DIT_SG
+#define CUTE_FMHA_DIT_SG 0
+#endif
+#ifndef CUTE_FMHA_DIT_MMAK
+#define CUTE_FMHA_DIT_MMAK 16
+#endif
+#ifndef CUTE_FMHA_DIT_VTILE
+#define CUTE_FMHA_DIT_VTILE 0
+#endif
+#ifndef CUTE_FMHA_DIT_KV
+#define CUTE_FMHA_DIT_KV 0
+#endif
+#ifndef CUTE_FMHA_DIT_STATIC_HD
+#define CUTE_FMHA_DIT_STATIC_HD 0
+#endif
+#ifndef CUTE_FMHA_DIT_SGN
+#define CUTE_FMHA_DIT_SGN 0
+#endif
+      run_d128_tile<cutlass::bfloat16_t, CUTE_FMHA_DIT_STAGES, CUTE_FMHA_DIT_QTILE,
+                    CUTE_FMHA_DIT_SG, CUTE_FMHA_DIT_MMAK, CUTE_FMHA_DIT_VTILE, 0,
+                    CUTE_FMHA_DIT_KV, (CUTE_FMHA_DIT_STATIC_HD != 0), CUTE_FMHA_DIT_SGN>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
+          B, H, Lq, Lkv, D, scale,
+          q.stride(2), q.stride(1), q.stride(0),
+          k.stride(2), k.stride(1), k.stride(0),
+          v.stride(2), v.stride(1), v.stride(0),
+          output.stride(2), output.stride(1), output.stride(0));
+      return output;
+    }
+    run_d128_tile<cutlass::bfloat16_t>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(),
+        B, H, Lq, Lkv, D, scale,
+        q.stride(2), q.stride(1), q.stride(0),
+        k.stride(2), k.stride(1), k.stride(0),
+        v.stride(2), v.stride(1), v.stride(0),
+        output.stride(2), output.stride(1), output.stride(0));
+  } else {
+    TORCH_CHECK(false, "cute_fmha: D128 attention supports fp16/bf16 only");
+  }
+  return output;
+}
+
+at::Tensor sdp_minimax_h3_vae_d64(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  TORCH_CHECK(
+      q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+      "cute_fmha: MiniMax H3 VAE attention expects BHLD tensors");
+  TORCH_CHECK(
+      q.device().is_xpu() && k.device() == q.device() && v.device() == q.device(),
+      "cute_fmha: MiniMax H3 VAE attention requires one XPU device");
+  TORCH_CHECK(
+      q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf &&
+          v.scalar_type() == at::kHalf,
+      "cute_fmha: MiniMax H3 VAE attention requires FP16 Q/K/V");
+  constexpr int B = 1;
+  constexpr int H = 32;
+  constexpr int D = 64;
+  const int L = checked_int(q.size(2), "MiniMax H3 VAE sequence length");
+  TORCH_CHECK(
+      q.sizes() == at::IntArrayRef({B, H, L, D}) &&
+          k.sizes() == q.sizes() && v.sizes() == q.sizes() && L > 5,
+      "cute_fmha: unsupported MiniMax H3 VAE attention shapes");
+  const int64_t qk_batch_stride = static_cast<int64_t>(L) * H * D;
+  const int64_t v_batch_stride = 3 * qk_batch_stride;
+  const auto has_qk_layout = [qk_batch_stride](const at::Tensor& tensor) {
+    return tensor.stride(0) == qk_batch_stride && tensor.stride(1) == D &&
+        tensor.stride(2) == H * D && tensor.stride(3) == 1;
+  };
+  const bool has_v_layout =
+      v.stride(0) == v_batch_stride && v.stride(1) == 3 * D &&
+      v.stride(2) == 3 * H * D && v.stride(3) == 1;
+  TORCH_CHECK(
+      has_qk_layout(q) && has_qk_layout(k) && has_v_layout,
+      "cute_fmha: unsupported MiniMax H3 VAE Q/K/V layout");
+
+  at::Tensor output =
+      at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
+  const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+  // -DCUTE_FMHA_VAE_QTILE=128|64 shrinks the Q tile for the short VAE tiles
+  // (L~1797: 256-row tiles leave the last tile 2% utilised); subgroup layout
+  // scales with it to keep 16 rows per subgroup.
+#ifndef CUTE_FMHA_VAE_QTILE
+#define CUTE_FMHA_VAE_QTILE 0
+#endif
+#ifndef CUTE_FMHA_VAE_STAGES
+#define CUTE_FMHA_VAE_STAGES 0
+#endif
+#ifndef CUTE_FMHA_VAE_KV
+#define CUTE_FMHA_VAE_KV 0
+#endif
+  run_d128_tile<cutlass::half_t, CUTE_FMHA_VAE_STAGES, CUTE_FMHA_VAE_QTILE,
+                (CUTE_FMHA_VAE_QTILE > 0 ? CUTE_FMHA_VAE_QTILE / 16 : 0),
+                0, 0, 64, CUTE_FMHA_VAE_KV>(
+      q.data_ptr(), k.data_ptr(), v.data_ptr(), output.data_ptr(), B, H, L, L,
+      D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+      k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+      output.stride(2), output.stride(1), output.stride(0));
+  return output;
+}
+#endif
+
+at::Tensor sdp_bhld_d120(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v) {
+  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+              "cute_fmha: expect BHLD tensors");
+  TORCH_CHECK(q.device().is_xpu() && k.device().is_xpu() && v.device().is_xpu(),
+              "cute_fmha: q, k, v must all be XPU tensors");
+  TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+              "cute_fmha: q, k, v must share dtype");
+
+  const int B = checked_int(q.size(0), "batch");
+  const int H = checked_int(q.size(1), "head count");
+  const int L = checked_int(q.size(2), "sequence length");
+  const int D = checked_int(q.size(3), "head dimension");
+  TORCH_CHECK(B == 1, "cute_fmha: D120 BHLD requires B==1");
+  TORCH_CHECK(D == 120, "cute_fmha: D120 BHLD requires head_dim==120");
+  TORCH_CHECK(k.sizes() == q.sizes() && v.sizes() == q.sizes(),
+              "cute_fmha: D120 BHLD requires matching self-attention Q/K/V");
+  TORCH_CHECK(is_supported_bhld_layout(q, B, H, L, D) &&
+                  is_supported_bhld_layout(k, B, H, L, D) &&
+                  is_supported_bhld_layout(v, B, H, L, D),
+              "cute_fmha: D120 BHLD requires dense packed-BHLD or BLHD-backed tensors");
+
+  // BLHD storage exposed as BHLD matches Torch SDPA's output strides. The
+  // following ComfyUI transpose+reshape is therefore a metadata-only view.
+  at::Tensor o = at::empty({B, L, H, D}, q.options()).permute({0, 2, 1, 3});
+  const float scale = 1.0f / std::sqrt((float)D);
+  if (q.scalar_type() == at::kHalf) {
+#if defined(OMNI_XPU_ARCH_BMG)
+    auto& queue =
+        c10::xpu::getCurrentXPUStream(q.device().index()).queue();
+    const bool use_b60 =
+        omni_xpu::device::use_b60_kernel_profile(queue);
+    // B60's L4205 workflow benefits from a 64-wide V tile. B70 and
+    // unrecognized BMG IDs keep the shipped V32 specialization.
+    if (use_b60 && L == 4205) {
+      run_d128_tile<
+          cutlass::half_t,
+          1,
+          0,
+          0,
+          0,
+          omni_xpu::device::B60KernelPolicy::d120_l4205_v_tile>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
+          D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          o.stride(2), o.stride(1), o.stride(0));
+      return o;
+    }
+    // L4096 has no Q-tile remainder.  Doubling both the Q tile and subgroup
+    // count preserves the proven 16-row per-subgroup fragment while halving
+    // work-group scheduling and reusing each K/V traversal across twice as
+    // many queries.  L4205 retains Q256/SG16 because its Q512 tail regresses.
+    if (L == 4096) {
+      run_d128_tile<cutlass::half_t, 1, 512, 32>(
+          q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L,
+          D, scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+          k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+          o.stride(2), o.stride(1), o.stride(0));
+      return o;
+    }
+#endif
+    run_d128_tile<cutlass::half_t, 1>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L, D,
+        scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+        k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+        o.stride(2), o.stride(1), o.stride(0));
+  } else if (q.scalar_type() == at::kBFloat16) {
+    run_d128_tile<cutlass::bfloat16_t, 1>(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(), B, H, L, L, D,
+        scale, q.stride(2), q.stride(1), q.stride(0), k.stride(2),
+        k.stride(1), k.stride(0), v.stride(2), v.stride(1), v.stride(0),
+        o.stride(2), o.stride(1), o.stride(0));
+  } else {
+    TORCH_CHECK(false, "cute_fmha: D120 BHLD supports fp16/bf16 only");
+  }
+  return o;
+}
+#endif
+
+}  // namespace
+
+// Op namespace overridable so KV32 and KV64 builds can be loaded side-by-side.
+// TORCH_LIBRARY stringifies its first token, so the macro value must be pasted
+// through an indirection to actually expand CUTE_FMHA_NS before registration.
+#ifndef CUTE_FMHA_NS
+#define CUTE_FMHA_NS cute_fmha
+#endif
+#if defined(OMNI_XPU_ARCH_PTL_H) || defined(OMNI_XPU_ARCH_BMG)
+#define CUTE_FMHA_D120_DEF(m) m.def("sdp_bhld_d120(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_D120_IMPL(m) m.impl("sdp_bhld_d120", &sdp_bhld_d120);
+#else
+#define CUTE_FMHA_D120_DEF(m)
+#define CUTE_FMHA_D120_IMPL(m)
+#endif
+#if defined(OMNI_XPU_ARCH_BMG)
+#define CUTE_FMHA_WAN22_DEF(m) \
+  m.def("sdp_wan22_cross(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_WAN22_IMPL(m) \
+  m.impl("sdp_wan22_cross", &sdp_wan22_cross);
+#define CUTE_FMHA_BHLD_D128_DEF(m) \
+  m.def("sdp_bhld_d128(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_BHLD_D128_IMPL(m) \
+  m.impl("sdp_bhld_d128", &sdp_bhld_d128);
+#define CUTE_FMHA_H3_VAE_D64_DEF(m) \
+  m.def("sdp_minimax_h3_vae_d64(Tensor q, Tensor k, Tensor v) -> Tensor");
+#define CUTE_FMHA_H3_VAE_D64_IMPL(m) \
+  m.impl("sdp_minimax_h3_vae_d64", &sdp_minimax_h3_vae_d64);
+#else
+#define CUTE_FMHA_WAN22_DEF(m)
+#define CUTE_FMHA_WAN22_IMPL(m)
+#define CUTE_FMHA_BHLD_D128_DEF(m)
+#define CUTE_FMHA_BHLD_D128_IMPL(m)
+#define CUTE_FMHA_H3_VAE_D64_DEF(m)
+#define CUTE_FMHA_H3_VAE_D64_IMPL(m)
+#endif
+#define CUTE_FMHA_LIB_(NS) \
+  TORCH_LIBRARY(NS, m) { \
+    m.def("sdp(Tensor q, Tensor k, Tensor v) -> Tensor"); \
+    CUTE_FMHA_WAN22_DEF(m) \
+    CUTE_FMHA_BHLD_D128_DEF(m) \
+    CUTE_FMHA_H3_VAE_D64_DEF(m) \
+    CUTE_FMHA_D120_DEF(m) \
+  } \
+  TORCH_LIBRARY_IMPL(NS, XPU, m) { \
+    m.impl("sdp", &sdp); \
+    CUTE_FMHA_WAN22_IMPL(m) \
+    CUTE_FMHA_BHLD_D128_IMPL(m) \
+    CUTE_FMHA_H3_VAE_D64_IMPL(m) \
+    CUTE_FMHA_D120_IMPL(m) \
+  }
+#define CUTE_FMHA_LIB(NS) CUTE_FMHA_LIB_(NS)
+CUTE_FMHA_LIB(CUTE_FMHA_NS)

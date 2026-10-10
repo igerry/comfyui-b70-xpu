@@ -1,0 +1,40 @@
+--- backends/triton/__init__.py	2026-09-05 00:41:12.524373026 +0000
++++ backends/triton/__init__.py	2026-09-05 00:14:24.394751689 +0000
+@@ -30,6 +30,9 @@
+ ]
+ 
+ # Try to import triton and register if available
++import os
++import sys
++
+ import torch
+ 
+ from comfy_kitchen.constraints import (
+@@ -43,6 +46,12 @@
+ 
+ _TRITON_AVAILABLE = True
+ _TRITON_ERROR = None
++_WINDOWS_TRITON_ENV = "COMFY_KITCHEN_ENABLE_TRITON_WINDOWS"
++
++
++def _windows_triton_opted_in() -> bool:
++    value = os.environ.get(_WINDOWS_TRITON_ENV, "")
++    return value.strip().lower() in {"1", "true", "yes", "on"}
+ 
+ try:
+     import triton  # noqa: F401
+@@ -341,6 +350,14 @@
+ 
+ 
+ def _register():
++    if sys.platform == "win32" and not _windows_triton_opted_in():
++        registry.mark_unavailable(
++            "triton",
++            "Triton is unavailable by default on Windows; "
++            f"set {_WINDOWS_TRITON_ENV}=1 before importing comfy_kitchen to enable it",
++        )
++        return
++
+     if not _TRITON_AVAILABLE:
+         registry.mark_unavailable("triton", _TRITON_ERROR or "Triton not available")
+         return

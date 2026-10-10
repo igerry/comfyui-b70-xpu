@@ -1,0 +1,110 @@
+--- backends/eager/__init__.py	2026-09-05 00:41:12.445676041 +0000
++++ backends/eager/__init__.py	2026-09-05 00:14:24.393195247 +0000
+@@ -27,6 +27,7 @@
+     "dequantize_int8_convrot_weight_dtype",
+     "dequantize_int8_embedding",
+     "dequantize_convrot_w4a4_weight",
++    "dequantize_gguf",
+     "dequantize_w4a8_int8_weight",
+     "gemv_awq_w4a16",
+     "convrot_w4a4_linear",
+@@ -45,8 +46,10 @@
+     "scaled_mm_mxfp8",
+     "scaled_mm_nvfp4",
+     "scaled_mm_svdquant_w4a4",
++    "svdquant_w4a16_linear",
+     "stochastic_rounding_fp8",
+     "int8_linear",
++    "mm_int8",
+     "w4a8_int8_linear",
+ ]
+ 
+@@ -68,6 +71,7 @@
+     prepare_int4_weight_for_int8_linear,
+     quantize_convrot_w4a4_weight,
+ )
++from .gguf import dequantize_gguf
+ from .na import na3d
+ from .quantization import (
+     dequantize_int8_convrot_weight,
+@@ -79,6 +83,7 @@
+     dequantize_nvfp4,
+     dequantize_per_tensor_fp8,
+     int8_linear,
++    mm_int8,
+     quantize_and_rotate_rowwise,
+     quantize_int8_convrot_weight,
+     quantize_int8_rowwise,
+@@ -110,6 +115,7 @@
+     rms_rope_split_half_,
+ )
+ from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
++from .svdquant_w4a16 import svdquant_w4a16_linear
+ from .w4a8_int8 import (
+     dequantize_w4a8_int8_weight,
+     quantize_w4a8_int8_weight,
+@@ -432,6 +438,64 @@
+         ),
+     }
+ 
++    # Fork extensions retained across the upstream 0.2.28 synchronization.
++    out["dequantize_gguf"] = FunctionConstraints(
++        params={
++            "data": ParamConstraint(dtypes=frozenset({torch.uint8})),
++            "quant_type_code": ParamConstraint(dtypes=frozenset({int})),
++            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
++            "layout_code": ParamConstraint(dtypes=frozenset({int})),
++        },
++        default_devices=all_devices,
++    )
++    out["svdquant_w4a16_linear"] = FunctionConstraints(
++        params={
++            "x": ParamConstraint(
++                dtypes=frozenset({torch.float16, torch.bfloat16}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "packed_u4": ParamConstraint(
++                dtypes=frozenset({torch.uint8}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "scales_f16": ParamConstraint(
++                dtypes=frozenset({torch.float16}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "rcp_smooth_f16": ParamConstraint(
++                dtypes=frozenset({torch.float16}),
++                shape_rules=(ExactDims(1),),
++            ),
++            "lora_down": ParamConstraint(
++                dtypes=frozenset({torch.float16, torch.bfloat16}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "lora_up": ParamConstraint(
++                dtypes=frozenset({torch.float16, torch.bfloat16}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "bias": ParamConstraint(
++                dtypes=frozenset({torch.float16, torch.bfloat16}),
++                shape_rules=(ExactDims(1),),
++            ),
++            "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
++        },
++        default_devices=all_devices,
++    )
++    out["mm_int8"] = FunctionConstraints(
++        params={
++            "a": ParamConstraint(
++                dtypes=frozenset({torch.int8}),
++                shape_rules=(ExactDims(2),),
++            ),
++            "b": ParamConstraint(
++                dtypes=frozenset({torch.int8}),
++                shape_rules=(ExactDims(2),),
++            ),
++        },
++        default_devices=all_devices,
++    )
++
+     out["quantize_int8_tensorwise"] = FunctionConstraints(
+         params={
+             "x": ParamConstraint(dtypes=standard_floats),

@@ -1,0 +1,290 @@
+diff --git a/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp b/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
+index 6f0ab4a8..c5c8c581 100644
+--- a/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
++++ b/applications/flash_attention_v2/collective/xe_fmha_fwd_mainloop.hpp
+@@ -276,6 +276,25 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+     /* Create register fragments for MMA and copies */
+     auto tQrQ = thr_copy_q.partition_sg_fragment_D(gQ(_,_,0));
+     auto tSrQ = thr_mma_qk.partition_sg_fragment_A(gQ(_,_,0));
++#if defined(CUTE_FMHA_HOIST_Q)
++#ifndef CUTE_FMHA_HOIST_Q_MAX_CHUNKS
++#define CUTE_FMHA_HOIST_Q_MAX_CHUNKS 8
++#endif
++    /* Q is invariant across KV blocks: keep every reordered head-dim chunk in GRF. */
++    static constexpr int kQChunksMax = CUTE_FMHA_HOIST_Q_MAX_CHUNKS;
++    decltype(tSrQ) tSrQ_all[kQChunksMax];
++    const int q_chunks = size<4>(tKgK);
++    const bool hoist_q = (q_chunks <= kQChunksMax);
++#endif
++
++#ifndef CUTE_FMHA_HOIST_Q_PARTIAL
++#define CUTE_FMHA_HOIST_Q_PARTIAL 0
++#endif
++#if CUTE_FMHA_HOIST_Q_PARTIAL > 0
++    /* phase-6: keep the first N reordered Q chunks in GRF; reload the remainder per KV block. */
++    static constexpr int kQHoist = CUTE_FMHA_HOIST_Q_PARTIAL;
++    decltype(tSrQ) tSrQ_part[kQHoist];
++#endif
+ 
+     auto tKrK = thr_copy_k.partition_sg_fragment_D(gK(_,_,0,0));
+     auto tSrK = thr_mma_qk.partition_sg_fragment_B(gK(_,_,0,0));
+@@ -307,9 +326,11 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+     /* Initialization steps for first block: Q/K prefetch, O init */
+     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
+     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
++    CUTLASS_PRAGMA_UNROLL   // phase-3b: static with StaticHeadDim
+     for (int D = 0; D < size<3>(pQgQ); D++) {
+       prefetch(prefetch_q, pQgQ(_,_,_,D));
+     }
++    CUTLASS_PRAGMA_UNROLL
+     for (int D = 0; D < size<4>(pKgK); D++) {
+       CUTLASS_PRAGMA_UNROLL
+       for (int K = 0; K < Stages; K++) {
+@@ -340,7 +361,15 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+                             auto& prefetch_v_cur, auto& tKgK_cur,
+                             auto& tVgV_cur, auto& pVgV_cur) {
+       /* Split barrier to keep threads together */
+-      barrier_arrive(ScopeWorkgroup);
++#ifndef CUTE_FMHA_BARRIER_EVERY
++#define CUTE_FMHA_BARRIER_EVERY 1
++#endif
++#if !defined(CUTE_FMHA_DIAG_NO_BARRIER)
++      /* phase-5: K is workgroup-uniform, so this predicate is uniform and the split barrier
++         stays correctly paired; N>1 lets the subgroups run ahead between sync points. */
++      const bool do_barrier = (CUTE_FMHA_BARRIER_EVERY == 1) || (K % CUTE_FMHA_BARRIER_EVERY == 0);
++      if (do_barrier) barrier_arrive(ScopeWorkgroup);
++#endif
+       constexpr bool is_cache = decltype(cached_k)::value;
+ 
+       int k_idx;
+@@ -355,6 +384,32 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+ 
+       /* GEMM 1: S = K * Q */
+       clear(tSrS);
++#if defined(CUTE_FMHA_HOIST_Q)
++      if (hoist_q) {
++        CUTLASS_PRAGMA_UNROLL
++        for (int D = 0; D < kQChunksMax; D++) {
++          if (D < q_chunks) {
++            copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
++            reorder(tKrK, tSrK);
++            cute::gemm(mma_qk, tSrQ_all[D], tSrK, tSrS);
++          }
++        }
++      } else
++#endif
++#if CUTE_FMHA_HOIST_Q_PARTIAL > 0
++      CUTLASS_PRAGMA_UNROLL
++      for (int D = 0; D < size<4>(tKgK); D++) {
++        copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
++        reorder(tKrK, tSrK);
++        if (D < kQHoist) {
++          cute::gemm(mma_qk, tSrQ_part[D], tSrK, tSrS);
++        } else {
++          copy(copy_q, tQgQ(_,_,_,D), tQrQ);
++          reorder(tQrQ, tSrQ);
++          cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
++        }
++      }
++#else
+       CUTLASS_PRAGMA_UNROLL
+       for (int D = 0; D < size<4>(tKgK); D++) {
+         copy(copy_q, tQgQ(_,_,_,D), tQrQ);
+@@ -364,6 +419,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+ 
+         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
+       }
++#endif
+ 
+       /* V prefetch for GEMM 2 */
+       CUTLASS_PRAGMA_UNROLL
+@@ -405,8 +461,27 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+       }
+ 
+       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
+-      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum);
++#if defined(CUTE_FMHA_DIAG_NO_SOFTMAX)
++      FragSRow rescale;
++      fill(rescale, ElementS(1));
++      const bool do_rescale = false;
++#else
++      bool max_changed = true;
++      auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, max_changed);
++#if defined(CUTE_FMHA_DIAG_NO_RESCALE)
++      const bool do_rescale = false;
++#elif defined(CUTE_FMHA_LAZY_RESCALE) && CUTE_FMHA_LAZY_RESCALE
++      /* Phase-3a: rescale == exp2(0) == 1 on every row when no row max moved -> skip the 4xVTiles fmuls. */
++      const bool do_rescale = (K != blk_k0) && max_changed;
++#else
++      const bool do_rescale = (K != blk_k0);
++#endif
++#endif
++#if defined(CUTE_FMHA_DIAG_NO_SP_DEP) && CUTE_FMHA_DIAG_NO_SP_DEP
++      /* phase-7: leave tArP alone so GEMM2 does not wait on GEMM1 + softmax. Timing only. */
++#else
+       reorder(tSrS, tArP);
++#endif
+ 
+       /* GEMM 2: A += P * V, split in v dimension.
+         tArA rescaling is fused to per-VTile */
+@@ -414,7 +489,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+       for (int VV = 0; VV < VTiles; VV++) {
+         copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
+         reorder(tVrV, tArV);
+-        if (K != blk_k0) {
++        if (do_rescale) {
+           CUTLASS_PRAGMA_UNROLL
+           for (int i = 0; i < tArA.size() / VTiles; i++)
+             tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
+@@ -424,7 +499,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+       }
+ 
+       /* K prefetch */
++#if !defined(CUTE_FMHA_DIAG_NO_KPREFETCH)
+       int K_next = K + Stages;
++      CUTLASS_PRAGMA_UNROLL   // phase-3b
+       for (int D = 0; D < size<4>(pKgK); D++) {
+         if constexpr (is_cache) {
+           bool is_cache_next = K_next < kblocks_cache;
+@@ -443,9 +520,34 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+           prefetch(prefetch_k, pKgK(_,_,_,K_next-kblocks_cache,D));
+         }
+       }
+-      barrier_wait(ScopeWorkgroup);
++#endif  // CUTE_FMHA_DIAG_NO_KPREFETCH
++#if !defined(CUTE_FMHA_DIAG_NO_BARRIER)
++      if (do_barrier) barrier_wait(ScopeWorkgroup);
++#endif
+     };
+ 
++#if defined(CUTE_FMHA_HOIST_Q)
++    /* Load + reorder Q once (was: per KV block, per head-dim chunk). */
++    if (hoist_q) {
++      CUTLASS_PRAGMA_UNROLL
++      for (int D = 0; D < kQChunksMax; D++) {
++        if (D < q_chunks) {
++          copy(copy_q, tQgQ(_,_,_,D), tQrQ);
++          reorder(tQrQ, tSrQ_all[D]);
++        }
++      }
++    }
++#endif
++#if CUTE_FMHA_HOIST_Q_PARTIAL > 0
++    /* Load + reorder the resident Q chunks once. */
++    CUTLASS_PRAGMA_UNROLL
++    for (int D = 0; D < kQHoist; D++) {
++      if (D < size<4>(tKgK)) {
++        copy(copy_q, tQgQ(_,_,_,D), tQrQ);
++        reorder(tQrQ, tSrQ_part[D]);
++      }
++    }
++#endif
+     /* Main loop, blocked in k. */
+     if constexpr (CachedKV) {
+       for (int K = blk_k0; K < kblocks_cache; K++) {
+@@ -470,17 +572,48 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, CachedKV_, PagedKV_,
+   softmax(bool       first_block, // First softmax block?
+           FragS    & tS,          // Softmax src/dst block
+           FragSRow & tS_max,      // Softmax row-wise max accumulator
+-          FragSRow & tS_sum) {    // Softmax row-wise sum accumulator
++          FragSRow & tS_sum,      // Softmax row-wise sum accumulator
++          bool     & max_changed) { // Out: did any row max in this subgroup move? (phase-3a)
+     /* Compute row-wise maxima for this block */
+     auto tS_bmax = reduce<1>(tS, sycl::maximum{});
+ 
+     FragSRow rescale;
++    bool changed_lane = false;
++#if defined(CUTE_FMHA_LAZY_SINK_EXP) && CUTE_FMHA_LAZY_SINK_EXP
++    /* phase-3d: decide first, then only pay for the exp2s when some row actually moved. */
++    FragSRow new_max_v;
++    CUTLASS_PRAGMA_UNROLL
++    for (int i = 0; i < tS_max.size(); i++) {
++      new_max_v(i) = sycl::max(tS_max(i), params.scale * tS_bmax(i));
++      changed_lane |= (new_max_v(i) != tS_max(i));
++    }
++    max_changed = sycl::any_of_group(sycl::ext::oneapi::this_work_item::get_sub_group(), changed_lane);
++    if (max_changed) {
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < tS_max.size(); i++) {
++        rescale(i) = sycl::native::exp2(tS_max(i) - new_max_v(i));
++        tS_max(i) = new_max_v(i);
++      }
++    } else {
++      CUTLASS_PRAGMA_UNROLL
++      for (int i = 0; i < rescale.size(); i++) rescale(i) = ElementS(1);
++    }
++#else
+     CUTLASS_PRAGMA_UNROLL
+     for (int i = 0; i < tS_max.size(); i++) {
+       ElementS new_max = sycl::max(tS_max(i), params.scale * tS_bmax(i));
++      changed_lane |= (new_max != tS_max(i));
+       rescale(i) = sycl::native::exp2(tS_max(i) - new_max);
+       tS_max(i) = new_max;
+     }
++#endif
++#if defined(CUTE_FMHA_LAZY_SINK_EXP) && CUTE_FMHA_LAZY_SINK_EXP
++    /* max_changed already set above. */
++#elif defined(CUTE_FMHA_LAZY_RESCALE) && CUTE_FMHA_LAZY_RESCALE
++    max_changed = sycl::any_of_group(sycl::ext::oneapi::this_work_item::get_sub_group(), changed_lane);
++#else
++    max_changed = true;
++#endif
+ 
+     /* Scale S and subtract maxima, then exponentiate */
+     CUTLASS_PRAGMA_UNROLL
+diff --git a/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp b/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
+index b70ffdb1..4daba36c 100644
+--- a/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
++++ b/applications/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp
+@@ -245,13 +245,25 @@ public:
+       }
+ 
+       auto batch_dim = is_var_len ? 1 : s.batch;
+-      auto shape_Q = make_shape(seq_len_qo, s.head_size_qk, s.num_heads_q, batch_dim);
+-      auto shape_K = make_shape(seq_len_kv, s.head_size_qk, s.num_heads_kv, batch_dim);
+-      auto shape_V = make_shape(s.head_size_vo, seq_len_kv, s.num_heads_kv, batch_dim);
+-      auto shape_O = make_shape(seq_len_qo, s.head_size_vo, s.num_heads_q, batch_dim);
+-
+-      auto shape_K_cache = make_shape(seq_len_kv_cache, s.head_size_qk, s.num_heads_kv, batch_dim);
+-      auto shape_V_cache = make_shape(s.head_size_vo, seq_len_kv_cache, s.num_heads_kv, batch_dim);
++      /* phase-3b: head-dim extents come from the mainloop tensor types when static (Int<D>). */
++      using HDqk_t = decltype(get<1>(shape(typename CollectiveMainloop::TensorQ{})));
++      using HDvo_t = decltype(get<0>(shape(typename CollectiveMainloop::TensorV{})));
++      auto hd_qk = [&] { if constexpr (is_static<HDqk_t>::value) return HDqk_t{}; else return s.head_size_qk; }();
++      auto hd_vo = [&] { if constexpr (is_static<HDvo_t>::value) return HDvo_t{}; else return s.head_size_vo; }();
++      auto shape_Q = make_shape(seq_len_qo, hd_qk, s.num_heads_q, batch_dim);
++      auto shape_K = make_shape(seq_len_kv, hd_qk, s.num_heads_kv, batch_dim);
++      auto shape_V = make_shape(hd_vo, seq_len_kv, s.num_heads_kv, batch_dim);
++      auto shape_O = make_shape(seq_len_qo, hd_vo, s.num_heads_q, batch_dim);
++
++      auto shape_K_cache = make_shape(seq_len_kv_cache, hd_qk, s.num_heads_kv, batch_dim);
++      auto shape_V_cache = make_shape(hd_vo, seq_len_kv_cache, s.num_heads_kv, batch_dim);
++      /* all-int copies for make_cute_packed_stride (var-len path only, but it must still compile) */
++      auto shape_Q_dyn = make_shape(seq_len_qo, int(hd_qk), s.num_heads_q, batch_dim);
++      auto shape_K_dyn = make_shape(seq_len_kv, int(hd_qk), s.num_heads_kv, batch_dim);
++      auto shape_V_dyn = make_shape(int(hd_vo), seq_len_kv, s.num_heads_kv, batch_dim);
++      auto shape_O_dyn = make_shape(seq_len_qo, int(hd_vo), s.num_heads_q, batch_dim);
++      auto shape_K_cache_dyn = make_shape(seq_len_kv_cache, int(hd_qk), s.num_heads_kv, batch_dim);
++      auto shape_V_cache_dyn = make_shape(int(hd_vo), seq_len_kv_cache, s.num_heads_kv, batch_dim);
+ 
+       auto dcQ = const_cast<ElementQ*>(p.Q + offset_q);
+       auto dcK = const_cast<ElementK*>(p.K + offset_k);
+@@ -260,12 +272,12 @@ public:
+       auto dcV_cache = const_cast<ElementV*>(p.V_cache + offset_v_cache);
+       auto ptrO = p.O + offset_o;
+ 
+-      auto stride_q = is_var_len ? cutlass::make_cute_packed_stride(StrideQ{}, shape_Q) : p.dQ;
+-      auto stride_k = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K) : p.dK;
+-      auto stride_v = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V) : p.dV;
+-      auto stride_o = is_var_len ? cutlass::make_cute_packed_stride(StrideO{}, shape_O) : p.dO;
+-      auto stride_k_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K_cache) : p.dK_cache;
+-      auto stride_v_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V_cache) : p.dV_cache;
++      auto stride_q = is_var_len ? cutlass::make_cute_packed_stride(StrideQ{}, shape_Q_dyn) : p.dQ;
++      auto stride_k = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K_dyn) : p.dK;
++      auto stride_v = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V_dyn) : p.dV;
++      auto stride_o = is_var_len ? cutlass::make_cute_packed_stride(StrideO{}, shape_O_dyn) : p.dO;
++      auto stride_k_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideK{}, shape_K_cache_dyn) : p.dK_cache;
++      auto stride_v_cache = is_var_len ? cutlass::make_cute_packed_stride(StrideV{}, shape_V_cache_dyn) : p.dV_cache;
+ 
+       Tensor Q = make_tensor(make_gmem_ptr(dcQ), make_layout(shape_Q, stride_q));
+       Tensor K = make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, stride_k));

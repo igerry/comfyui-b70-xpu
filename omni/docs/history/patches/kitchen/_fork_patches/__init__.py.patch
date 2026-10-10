@@ -1,0 +1,109 @@
+--- __init__.py	2026-09-05 00:41:12.033520215 +0000
++++ __init__.py	2026-09-05 00:14:24.391588101 +0000
+@@ -1,12 +1,12 @@
+ import torch
+ 
+-from .backends import cuda as _cuda_backend  # noqa: F401
++from ._version import __version__
+ 
+ # Import backends to trigger auto-registration
+ from .backends import eager as _eager_backend  # noqa: F401
+ from .backends import triton as _triton_backend  # noqa: F401
++from .backends import xpu as _xpu_backend  # noqa: F401
+ from .backends.eager.quantization import DTYPE_TO_CODE
+-from .backends.eager.quantization import mm_int8 as _mm_int8
+ from .exceptions import (
+     BackendError,
+     BackendNotFoundError,
+@@ -14,6 +14,15 @@
+     NoCapableBackendError,
+ )
+ from .float_utils import from_blocked, swap_nibbles, to_blocked
++from .gguf import dequantize_gguf, get_gguf_route_diagnostics
++from .svdquant_w4a16 import (
++    PreparedSVDQuantW4A16,
++    get_svdquant_w4a16_route_diagnostics,
++    prepare_svdquant_w4a16_for_xpu,
++    restore_svdquant_w4a16_source_,
++    svdquant_w4a16_linear,
++)
++
+ from .registry import registry
+ from .tensor.convrot_w4a4 import (
+     convrot_w4a4_linear,
+@@ -30,7 +39,10 @@
+ # ROCm PyTorch build so CUDA/CPU processes do not pay the import cost or acquire
+ # an unrelated GPU runtime merely because a combined wheel contains the module.
+ if getattr(torch.version, "hip", None):
+-    from .backends import hip as _hip_backend  # noqa: F401
++    try:
++        from .backends import hip as _hip_backend  # noqa: F401
++    except ImportError as error:
++        registry.mark_unavailable("hip", f"HIP backend is not packaged ({error})")
+ 
+     # The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4),
+     # and advertises only the ops that device can run; prefer it where it registers.
+@@ -40,6 +52,7 @@
+     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
+ 
+ __all__ = [
++    "__version__",
+     # Normalization
+     "adaln",
+     "rms_adaln",
+@@ -59,10 +72,17 @@
+     "quantize_int8_rowwise",
+     "quantize_int8_tensorwise",
+     "dequantize_int8_simple",
++    "dequantize_gguf",
++    "get_gguf_route_diagnostics",
++    "PreparedSVDQuantW4A16",
++    "get_svdquant_w4a16_route_diagnostics",
++    "prepare_svdquant_w4a16_for_xpu",
++    "restore_svdquant_w4a16_source_",
+     # Fused matmul
+     "scaled_mm_nvfp4",
+     "scaled_mm_mxfp8",
+     "scaled_mm_svdquant_w4a4",
++    "svdquant_w4a16_linear",
+     "convrot_w4a4_linear",
+     "dequantize_convrot_w4a4_weight",
+     "dequantize_w4a8_int8_weight",
+@@ -785,7 +805,9 @@
+ 
+ def mm_int8(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+     """INT8 matrix multiplication: C[M,N] = A[M,K] @ B[K,N]."""
+-    return _mm_int8(a, b)
++    kwargs = {"a": a, "b": b}
++    impl = registry.get_implementation("mm_int8", kwargs=kwargs)
++    return impl(**kwargs)
+ 
+ 
+ def int8_linear(
+@@ -843,7 +865,7 @@
+ 
+     Args:
+         priority: List of backend names in order of preference
+-                 Example: ["cuda", "eager"] to prefer CUDA over Torch
++                 Example: ["xpu", "triton", "eager"]
+     """
+     registry.set_priority(priority)
+ 
+@@ -852,7 +874,7 @@
+     """Disable a backend, preventing its use.
+ 
+     Args:
+-        name: Backend name to disable ("eager", "cuda", or "triton")
++        name: Backend name to disable ("xpu", "triton", or "eager")
+     """
+     registry.disable(name)
+ 
+@@ -861,7 +883,7 @@
+     """Re-enable a previously disabled backend.
+ 
+     Args:
+-        name: Backend name to enable ("eager", "cuda", or "triton")
++        name: Backend name to enable ("xpu", "triton", or "eager")
+     """
+     registry.enable(name)
+ 
