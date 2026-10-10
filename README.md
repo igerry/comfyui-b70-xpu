@@ -11,7 +11,7 @@ master on torch 2.13 with Intel's XPU acceleration layer carried over, repaired 
 broke it, and extended with kernels and fixes of our own.
 
 The repository follows the layout of [intel/llm-scaler](https://github.com/intel/llm-scaler)'s
-`omni/` directory, and the image is built **on top of Intel's published image**, so deployment is
+`omni/` directory, and the image is built **from Intel's published image**, so deployment is
 one `bash build.sh` and the run commands are the ones Intel documents.
 
 > Intel's `main` branch now carries an unpublished `0.2.0-b2` source build for ComfyUI 0.39 and
@@ -77,7 +77,9 @@ bash build.sh                 # -> comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 The build pulls `intel/llm-scaler-omni:0.2.0-b1`, adds Python 3.13 with `torch 2.13.0+xpu`,
 installs the 2026.0 DPC++ compiler in a throw-away stage, compiles `omni_xpu_kernel` from this
 repository (about 3 minutes on 16 threads), checks out ComfyUI at a pinned commit, and installs
-the Kitchen XPU backend and the `ComfyUI-OmniXPU` node. Intel's original stack stays in the image.
+the Kitchen XPU backend and the `ComfyUI-OmniXPU` node. Intel's original ComfyUI 0.31 / torch 2.11 /
+oneAPI stack is then removed and the result is written as a single-layer image; what is kept from
+Intel's image is the OS and the GPU user-space drivers.
 
 Validate, then run. Mount points and flags are the same as for Intel's image:
 
@@ -114,8 +116,6 @@ also run `python main.py ...` yourself, exactly as with Intel's image.
 - **Custom nodes.** Mount single nodes into `/llm/ComfyUI/custom_nodes/<name>`; do not mount over
   the whole directory, it holds `ComfyUI-OmniXPU`. Their Python dependencies go into the image's
   venv: `docker exec comfyui pip install ...`.
-- **A/B against Intel's stack from the same image:** append `/llm/entrypoints/start_official.sh`
-  to the run command. It starts the untouched ComfyUI 0.31 / torch 2.11 with the same mounts.
 
 More: [omni/README.md](omni/README.md), [build details and bare-metal install](omni/docs/IMAGE_BUILD.md),
 [models and switches](omni/docs/COMFYUI.md).
@@ -428,7 +428,7 @@ Releases.md                  list of releases
 omni/
   build.sh                   builds the image (reads omni/VERSION)
   docker/Dockerfile          FROM intel/llm-scaler-omni:0.2.0-b1
-  entrypoints/               start_comfyui.sh, validate_comfyui_image.sh, start_official.sh
+  entrypoints/               start_comfyui.sh, validate_comfyui_image.sh
   configs/                   comfyui_host_models.yaml (models mounted at /models/host)
   tools/                     validate_comfyui_image.py
   omni_xpu_kernel/           native kernels, full source with our changes

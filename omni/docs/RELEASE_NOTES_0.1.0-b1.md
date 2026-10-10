@@ -8,11 +8,11 @@
 
 ### What’s new
 
-* **ComfyUI 0.39 XPU stack on top of the 0.2.0-b1 image**
+* **ComfyUI 0.39 XPU stack built from the 0.2.0-b1 image**
   * Upstream ComfyUI master (`a4b5a045`, 0.39.0), Python 3.13, `torch 2.13.0+xpu`.
   * `omni_xpu_kernel` rebuilt for torch 2.13 with the 2026.0 compiler and oneDNN.
   * Stock `comfy-kitchen 0.2.37` with the XPU backend re-applied.
-  * Intel's original ComfyUI 0.31 stack stays in the image (`/llm/entrypoints/start_official.sh`).
+  * Intel's original ComfyUI 0.31 / torch 2.11 / oneAPI stack is removed; the OS and GPU drivers are kept.
 
 * **Compatibility fixes for ComfyUI 0.39** (all three were silent: the startup log was green)
   * XPU is reported as INT8-capable again (H3 sampling 7.3 → 6.2 s/step).

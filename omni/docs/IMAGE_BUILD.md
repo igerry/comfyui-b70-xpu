@@ -25,9 +25,13 @@ Stages of `docker/Dockerfile`:
 1. `pybase` — the base image plus Python 3.13 (deadsnakes) and a venv at `/opt/venv-b70` with torch.
 2. `kernel` — adds the 2026.0 DPC++ compiler and `onednn-devel`, patches `/llm/sycl-tla`, builds the
    `omni_xpu_kernel` wheel. Not part of the final image.
-3. `runtime-comfyui` — ComfyUI at the pinned commit in `/llm/ComfyUI` (Intel's 0.31 moves to
-   `/llm/ComfyUI-official`), requirements under `docker/constraints.txt` (the package list of the
+3. `assemble` — ComfyUI at the pinned commit in `/llm/ComfyUI`, requirements under `docker/constraints.txt` (the package list of the
    measured host), the Kitchen XPU patch, the wheel, the node, entrypoints, configs, tools, benchmarks.
+
+4. `runtime-comfyui` — `FROM scratch` plus one `COPY --from=assemble / /`. The `assemble` stage ends by
+   deleting Intel's original stack (`/opt/venv`, `/opt/intel`, old source checkouts and wheels);
+   copying into a fresh image is what actually frees that space, since deleting in a later layer
+   does not shrink an image.
 
 ## Acceptance
 

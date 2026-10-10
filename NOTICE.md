@@ -30,5 +30,5 @@ image is in `omni/patches/vs-intel-0.2.0-b1/`:
 - `ComfyUI-OmniXPU.diff`: 10 files. Adapter changes in `adapters/attention.py` and
   `adapters/norm.py`, hooks in `__init__.py`, and seven new modules under `fixes/`.
 
-The Docker image built from `omni/docker/Dockerfile` starts from Intel's published image and
-therefore contains everything that image contains, under the terms that apply to it.
+The Docker image built from `omni/docker/Dockerfile` starts from Intel's published image and keeps
+its operating system and Intel GPU user-space drivers, under the terms that apply to them.

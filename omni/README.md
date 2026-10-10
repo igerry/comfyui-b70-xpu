@@ -1,6 +1,6 @@
 # comfyui-b70-xpu: Omni image for Intel Arc Pro B70
 
-A single-XPU ComfyUI image for Intel Arc B-series (Battlemage) cards, built on top of
+A single-XPU ComfyUI image for Intel Arc B-series (Battlemage) cards, built from
 [`intel/llm-scaler-omni:0.2.0-b1`](https://github.com/intel/llm-scaler/releases/tag/omni-0.2.0-b1).
 It replaces the ComfyUI 0.31 / torch 2.11 stack of that image with upstream ComfyUI master on
 torch 2.13, a rebuilt `omni_xpu_kernel`, the XPU-enabled Comfy Kitchen backend on stock
@@ -11,8 +11,7 @@ What changed and what it is worth, with all measurements: [../README.md](../READ
 > [!IMPORTANT]
 > `0.1.0-b1` is available as a source build. It is tested on one Arc Pro B70 with four models
 > (MiniMax H3, Krea-2 Turbo, Qwen-Image 2.1, MiniMax Music 3). It does not include the SGLang
-> Diffusion, multi-XPU, GGUF or Nunchaku pieces of Intel's image in the new stack; for those, use
-> Intel's image directly.
+> Diffusion, multi-XPU, GGUF or Nunchaku pieces of Intel's image; for those, use Intel's image directly.
 
 ## Getting Started with the Docker Image
 
@@ -101,14 +100,6 @@ Notes:
 - Keep host models and mutable data outside `/llm/ComfyUI`, as with Intel's image.
 - If your model directory contains symlinks, also mount their targets at the same absolute path.
 
-### Run Intel's original stack from the same image
-
-For A/B comparisons the untouched ComfyUI 0.31 / torch 2.11 stack is kept:
-
-```bash
-sudo docker run -itd ... "$IMAGE" /llm/entrypoints/start_official.sh
-```
-
 ## Image contents
 
 - upstream [ComfyUI](https://github.com/comfyanonymous/ComfyUI) pinned to
@@ -120,7 +111,8 @@ sudo docker run -itd ... "$IMAGE" /llm/entrypoints/start_official.sh
 - [ComfyUI-OmniXPU](ComfyUI-OmniXPU/README.md) with the modules in `fixes/`;
 - the benchmark scripts in `/llm/benchmarks`;
 - an installed-package snapshot at `/llm/manifests/comfyui-b70-python-freeze.txt`;
-- everything of the base image, with its ComfyUI moved to `/llm/ComfyUI-official`.
+- from the base image: Ubuntu 24.04 and the Intel GPU user-space drivers. Intel's ComfyUI 0.31,
+  its torch 2.11 venv and the oneAPI 2025.3 toolkit are removed.
 
 No custom nodes other than `ComfyUI-OmniXPU` are installed in the new stack.
 

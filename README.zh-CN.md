@@ -10,7 +10,7 @@ Arc Pro B70（32 GB）上实际在用的方案：ComfyUI 上游最新版 + torch
 修好升级时坏掉的地方，再加上我们自己写的算子和修复。
 
 仓库的目录结构照着 [intel/llm-scaler](https://github.com/intel/llm-scaler) 的 `omni/` 目录来，
-镜像**建在 Intel 已发布的镜像之上**，所以部署只要一条 `bash build.sh`，运行命令也和官方文档里的一样。
+镜像**从 Intel 已发布的镜像构建**，所以部署只要一条 `bash build.sh`，运行命令也和官方文档里的一样。
 
 > Intel 的 `main` 分支上现在有一个尚未发布的 `0.2.0-b2` 源码构建，对应 ComfyUI 0.39 和 torch 2.14。
 > 我们没有构建和测过它。这里所有对比的对象都是已发布的 `0.2.0-b1` 镜像；等 `0.2.0-b2` 正式发布，
@@ -72,7 +72,8 @@ bash build.sh                 # 得到 comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 构建过程：拉取 `intel/llm-scaler-omni:0.2.0-b1`，加装 Python 3.13 和 `torch 2.13.0+xpu`，
 在一个用完即弃的阶段里装 2026.0 版 DPC++ 编译器，用本仓库的源码编译 `omni_xpu_kernel`
 （16 线程约 3 分钟），按固定提交检出 ComfyUI，装上 Kitchen 的 XPU 后端和 `ComfyUI-OmniXPU` 节点。
-官方镜像原有的那套环境仍留在镜像里。
+最后删掉官方镜像原有的 ComfyUI 0.31 / torch 2.11 / oneAPI 那套环境，把结果写成单层镜像；
+从官方镜像保留下来的是操作系统和显卡的用户态驱动。
 
 先验证，再运行。挂载点和参数与官方镜像相同：
 
@@ -106,8 +107,6 @@ docker run -itd --name comfyui \
   只跑 H3 就要约 52 GB，测试机是 96 GB。内存不够就加 `-e OMNIXPU_PIN_MEMORY=0`。
 - **自定义节点。** 把单个节点挂到 `/llm/ComfyUI/custom_nodes/<名字>`；不要整个目录覆盖挂载，
   里面有 `ComfyUI-OmniXPU`。节点的 Python 依赖装进镜像的环境：`docker exec comfyui pip install ...`。
-- **在同一个镜像里和官方方案对比：** 在运行命令末尾加上 `/llm/entrypoints/start_official.sh`，
-  它用同样的挂载启动原封不动的 ComfyUI 0.31 / torch 2.11。
 
 更多：[omni/README.md](omni/README.md)、[构建细节与裸机安装](omni/docs/IMAGE_BUILD.md)、
 [模型与开关](omni/docs/COMFYUI.md)（均为英文）。
@@ -405,7 +404,7 @@ Releases.md                  发布列表
 omni/
   build.sh                   构建镜像（版本号读 omni/VERSION）
   docker/Dockerfile          FROM intel/llm-scaler-omni:0.2.0-b1
-  entrypoints/               start_comfyui.sh、validate_comfyui_image.sh、start_official.sh
+  entrypoints/               start_comfyui.sh、validate_comfyui_image.sh
   configs/                   comfyui_host_models.yaml（模型挂在 /models/host）
   tools/                     validate_comfyui_image.py
   omni_xpu_kernel/           原生算子，含我们改动的完整源码
