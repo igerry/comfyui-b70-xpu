@@ -65,8 +65,17 @@ Full tables, including the pre-upgrade stack and every caveat, are in [Benchmark
 
 ## Quick start (Docker)
 
-Requirements: a Linux host with an Arc B-series GPU and working drivers, Docker with BuildKit,
-about 45 GB of free disk during the build (Intel's base image is 21 GB; the result is 10.8 GB), internet access during the build.
+Requirements: a Linux host with an Arc B-series GPU and working drivers, and Docker. Building it
+yourself additionally needs BuildKit, about 45 GB of free disk (Intel's base image is 21 GB) and
+internet access during the build.
+
+Pull the published image (10.8 GB, 17 layers, about 5.5 GB to download):
+
+```bash
+docker pull gerrywang/comfyui-b70-xpu:0.1.0-b1
+```
+
+or build it yourself:
 
 ```bash
 git clone https://github.com/igerry/comfyui-b70-xpu.git
@@ -78,13 +87,14 @@ The build pulls `intel/llm-scaler-omni:0.2.0-b1`, adds Python 3.13 with `torch 2
 installs the 2026.0 DPC++ compiler in a throw-away stage, compiles `omni_xpu_kernel` from this
 repository (about 3 minutes on 16 threads), checks out ComfyUI at a pinned commit, and installs
 the Kitchen XPU backend and the `ComfyUI-OmniXPU` node. Intel's original ComfyUI 0.31 / torch 2.11 /
-oneAPI stack is then removed and the result is written as a single-layer image; what is kept from
-Intel's image is the OS and the GPU user-space drivers.
+oneAPI stack is then removed and the result is written into a fresh image; what is kept from
+Intel's image is the OS and the GPU user-space drivers. The Python environment is spread over 16
+layers so that pushes and pulls run in parallel.
 
 Validate, then run. Mount points and flags are the same as for Intel's image:
 
 ```bash
-IMAGE=comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
+IMAGE=gerrywang/comfyui-b70-xpu:0.1.0-b1      # or your local comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 
 docker run --rm --device=/dev/dri "$IMAGE" /llm/entrypoints/validate_comfyui_image.sh
 
@@ -381,7 +391,9 @@ bare-metal install. With `--memory=96g` the pinned-memory budget inside the cont
 without it, on this LXC host, it came out as 917 GB. The startup log lists `convrot_w4a4` and
 `int8_tensorwise` under `Native ops`. The GPU drivers in the image are the ones from Intel's image,
 older than the host's (the card is reported as `Intel(R) Graphics [0xe223]`); no speed difference
-showed up. Not run in the container: the Turbo sampler node and MultiRef workflows (third-party
+showed up. The image published on Docker Hub is a later build of the same content split into 17
+layers; it passed the validator and one job per model (H3 55.8 s new seed) before it was pushed.
+Not run in the container: the Turbo sampler node and MultiRef workflows (third-party
 nodes), and anything without `--privileged`.
 
 ## Switches
@@ -462,7 +474,8 @@ omni/
 
 ## Releases
 
-Releases follow Intel's convention: a version, a git tag `omni-<version>`, and a Docker image.
+Releases follow Intel's convention: a version, a git tag `omni-<version>`, and a Docker image
+(`gerrywang/comfyui-b70-xpu:<version>` on Docker Hub).
 Version numbers are our own and independent of Intel's; each release states which Intel image it
 is built on (`0.1.0-b1` is built on `intel/llm-scaler-omni:0.2.0-b1`). See [Releases.md](Releases.md).
 

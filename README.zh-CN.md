@@ -60,8 +60,16 @@ Arc Pro B70（32 GB）上实际在用的方案：ComfyUI 上游最新版 + torch
 
 ## 快速开始（Docker）
 
-要求：Linux 主机，Arc B 系列显卡且驱动正常，带 BuildKit 的 Docker，构建期间约 45 GB 空闲磁盘
-（官方基础镜像 21 GB，最终镜像 10.8 GB），构建时能联网。
+要求：Linux 主机，Arc B 系列显卡且驱动正常，装有 Docker。自己构建的话还需要 BuildKit、
+约 45 GB 空闲磁盘（官方基础镜像 21 GB）以及构建时能联网。
+
+直接拉取已发布的镜像（10.8 GB，17 层，下载量约 5.5 GB）：
+
+```bash
+docker pull gerrywang/comfyui-b70-xpu:0.1.0-b1
+```
+
+或者自己构建：
 
 ```bash
 git clone https://github.com/igerry/comfyui-b70-xpu.git
@@ -72,13 +80,13 @@ bash build.sh                 # 得到 comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 构建过程：拉取 `intel/llm-scaler-omni:0.2.0-b1`，加装 Python 3.13 和 `torch 2.13.0+xpu`，
 在一个用完即弃的阶段里装 2026.0 版 DPC++ 编译器，用本仓库的源码编译 `omni_xpu_kernel`
 （16 线程约 3 分钟），按固定提交检出 ComfyUI，装上 Kitchen 的 XPU 后端和 `ComfyUI-OmniXPU` 节点。
-最后删掉官方镜像原有的 ComfyUI 0.31 / torch 2.11 / oneAPI 那套环境，把结果写成单层镜像；
-从官方镜像保留下来的是操作系统和显卡的用户态驱动。
+最后删掉官方镜像原有的 ComfyUI 0.31 / torch 2.11 / oneAPI 那套环境，把结果写进一个全新的镜像；
+从官方镜像保留下来的是操作系统和显卡的用户态驱动。Python 环境被拆成 16 层，这样上传和下载都能并行。
 
 先验证，再运行。挂载点和参数与官方镜像相同：
 
 ```bash
-IMAGE=comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
+IMAGE=gerrywang/comfyui-b70-xpu:0.1.0-b1      # 或者你本地构建的 comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
 
 docker run --rm --device=/dev/dri "$IMAGE" /llm/entrypoints/validate_comfyui_image.sh
 
@@ -357,7 +365,9 @@ ComfyUI 0.34 和官方镜像都加载不了这个模型，所以没有「之前�
 容器内每项只跑了一到两次。在跑间波动范围内，镜像复现了裸机安装的结果。加了 `--memory=96g` 后，
 容器内的锁页内存预算是 80 GB；不加的话，在这台 LXC 主机上会被算成 917 GB。启动日志的 `Native ops`
 里有 `convrot_w4a4` 和 `int8_tensorwise`。镜像里的显卡驱动是官方镜像自带的，比主机上的旧
-（显卡名显示为 `Intel(R) Graphics [0xe223]`），没有看到速度差异。容器内没跑的：Turbo 采样器节点和
+（显卡名显示为 `Intel(R) Graphics [0xe223]`），没有看到速度差异。发布到 Docker Hub 的镜像是之后重建的，
+内容相同，只是拆成了 17 层；推送前它通过了验收，并且每个模型各跑通了一个任务（H3 只换种子 55.8 秒）。
+容器内没跑的：Turbo 采样器节点和
 MultiRef 两个工作流（第三方节点），以及不带 `--privileged` 的情况。
 
 ## 开关
@@ -435,7 +445,8 @@ omni/
 
 ## 发布
 
-发布方式照官方的惯例：一个版本号、一个 git 标签 `omni-<版本号>`、一个 Docker 镜像。
+发布方式照官方的惯例：一个版本号、一个 git 标签 `omni-<版本号>`、一个 Docker 镜像
+（Docker Hub 上的 `gerrywang/comfyui-b70-xpu:<版本号>`）。
 版本号是我们自己的，和官方的编号无关；每个版本会写明它建在哪个官方镜像之上
 （`0.1.0-b1` 建在 `intel/llm-scaler-omni:0.2.0-b1` 之上）。见 [Releases.md](Releases.md)。
 

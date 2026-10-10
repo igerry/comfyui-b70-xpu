@@ -2,9 +2,10 @@
 
 ### Resources
 
+- **Docker Image**: [gerrywang/comfyui-b70-xpu:0.1.0-b1](https://hub.docker.com/r/gerrywang/comfyui-b70-xpu/tags) (`sha256:7a2c1aff2843f16190236d89aa84ec2f4868ab1b353770ca8e231a36f73cc76b`)
 - **Source build**: `cd omni && bash build.sh` → `comfyui-b70-xpu:0.1.0-b1-comfyui-bmg`
 - **Base image**: [intel/llm-scaler-omni:0.2.0-b1](https://hub.docker.com/layers/intel/llm-scaler-omni/0.2.0-b1/images/sha256-b692be544940c3896bdf11fb3d66bbc089f1214a9e4f6749c34de43db8fddf23)
-- **Image size**: 10.8 GB
+- **Image size**: 10.8 GB in 17 layers
 - **Tested on**: one Intel Arc Pro B70 (32 GB, 230 W); the benchmark suite was run both bare-metal and inside the image
 
 ### What’s new

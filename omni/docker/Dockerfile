@@ -13,7 +13,8 @@
 #   ../ComfyUI-OmniXPU
 #
 # The last stage copies the cleaned filesystem into a fresh image, so the removed files do not
-# stay behind in lower layers.
+# stay behind in lower layers. The venv is spread over 16 layers so that pushes and pulls run
+# in parallel.
 #
 # Build with ../build.sh (context is the omni/ directory).
 #
@@ -135,7 +136,18 @@ RUN rm -rf /opt/venv /opt/intel /wheels /llm/sycl-tla /llm/comfy-kitchen-xpu /ll
  && apt-get clean
 
 # --------------------------------------------------------------------------------------
-# runtime-comfyui: the cleaned filesystem as a single layer
+# split: cut the venv (8.8 of the 10.8 GB) into 16 parts of similar size
+# --------------------------------------------------------------------------------------
+# A single 10.8 GB layer is uploaded and downloaded over one connection and restarts from zero
+# when the transfer breaks. Docker moves layers in parallel, so the venv is spread over 16 layers.
+FROM assemble AS split
+RUN /usr/bin/python3.13 /llm/tools/split_layers.py /opt/venv-b70 /stage 16 400
+
+FROM split AS rootfs
+RUN rm -rf /stage
+
+# --------------------------------------------------------------------------------------
+# runtime-comfyui: the cleaned filesystem in a fresh image (1 base layer + 16 venv layers)
 # --------------------------------------------------------------------------------------
 FROM scratch AS runtime-comfyui
 ARG COMFYUI_COMMIT=a4b5a045e56fc334903db8457b728b64e006119c
@@ -146,7 +158,23 @@ ARG XPU_TARGET=bmg
 ARG SOURCE_REVISION=unknown
 ARG SOURCE_DIRTY=unknown
 ARG BASE_IMAGE
-COPY --from=assemble / /
+COPY --from=rootfs / /
+COPY --from=split /stage/00/ /
+COPY --from=split /stage/01/ /
+COPY --from=split /stage/02/ /
+COPY --from=split /stage/03/ /
+COPY --from=split /stage/04/ /
+COPY --from=split /stage/05/ /
+COPY --from=split /stage/06/ /
+COPY --from=split /stage/07/ /
+COPY --from=split /stage/08/ /
+COPY --from=split /stage/09/ /
+COPY --from=split /stage/10/ /
+COPY --from=split /stage/11/ /
+COPY --from=split /stage/12/ /
+COPY --from=split /stage/13/ /
+COPY --from=split /stage/14/ /
+COPY --from=split /stage/15/ /
 
 ENV PATH=/opt/venv-b70/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     VIRTUAL_ENV=/opt/venv-b70 \

@@ -9,13 +9,19 @@ comfy-kitchen 0.2.37, and an extended `ComfyUI-OmniXPU` integration layer.
 What changed and what it is worth, with all measurements: [../README.md](../README.md).
 
 > [!IMPORTANT]
-> `0.1.0-b1` is available as a source build (10.8 GB image). It is tested on one Arc Pro B70 with four models
+> `0.1.0-b1` is published as `gerrywang/comfyui-b70-xpu:0.1.0-b1` (10.8 GB) and as a source build. It is tested on one Arc Pro B70 with four models
 > (MiniMax H3, Krea-2 Turbo, Qwen-Image 2.1, MiniMax Music 3). It does not include the SGLang
 > Diffusion, multi-XPU, GGUF or Nunchaku pieces of Intel's image; for those, use Intel's image directly.
 
 ## Getting Started with the Docker Image
 
-Build from the `omni` directory:
+Pull the published image:
+
+```bash
+docker pull gerrywang/comfyui-b70-xpu:0.1.0-b1
+```
+
+or build from the `omni` directory:
 
 ```bash
 cd omni
@@ -36,7 +42,7 @@ The version is defined in [`VERSION`](VERSION). Released versions are listed in
 ### Validate the image
 
 ```bash
-IMAGE=comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
+IMAGE=gerrywang/comfyui-b70-xpu:0.1.0-b1
 
 sudo docker run --rm \
     --device=/dev/dri \
@@ -52,7 +58,7 @@ XPU availability, and that ComfyUI treats INT8 as a native XPU format.
 Mount the existing ComfyUI model directory rather than copying models into the image:
 
 ```bash
-IMAGE=comfyui-b70-xpu:0.1.0-b1-comfyui-bmg
+IMAGE=gerrywang/comfyui-b70-xpu:0.1.0-b1
 CONTAINER_NAME=comfyui
 COMFYUI_MODEL_DIR=/path/to/comfyui_models
 COMFYUI_INPUT_DIR=/path/to/comfyui_input

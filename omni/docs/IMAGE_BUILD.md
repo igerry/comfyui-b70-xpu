@@ -28,10 +28,15 @@ Stages of `docker/Dockerfile`:
 3. `assemble` — ComfyUI at the pinned commit in `/llm/ComfyUI`, requirements under `docker/constraints.txt` (the package list of the
    measured host), the Kitchen XPU patch, the wheel, the node, entrypoints, configs, tools, benchmarks.
 
-4. `runtime-comfyui` — `FROM scratch` plus one `COPY --from=assemble / /`. The `assemble` stage ends by
-   deleting Intel's original stack (`/opt/venv`, `/opt/intel`, old source checkouts and wheels);
-   copying into a fresh image is what actually frees that space, since deleting in a later layer
-   does not shrink an image.
+4. `split` / `rootfs` — `tools/split_layers.py` moves the venv (8.8 of the 10.8 GB) into 16 staging
+   directories of similar size; `rootfs` is the same filesystem without them.
+5. `runtime-comfyui` — `FROM scratch`, one `COPY` of `rootfs` and 16 `COPY`s of the staged parts.
+   The `assemble` stage ends by deleting Intel's original stack (`/opt/venv`, `/opt/intel`, old
+   source checkouts and wheels); copying into a fresh image is what actually frees that space,
+   since deleting in a later layer does not shrink an image. The 16 layers exist for transfer
+   speed: Docker moves layers in parallel and a registry connection can be far slower than the
+   link (measured here: one 10.8 GB layer uploaded at 0.34 MB/s, 17 layers at 2.4 MB/s), and a
+   broken transfer only repeats unfinished layers.
 
 ## Acceptance
 
