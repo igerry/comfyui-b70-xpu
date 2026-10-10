@@ -56,8 +56,9 @@ Measured on one Arc Pro B70 (32 GB) with four models: **MiniMax H3**, **Krea-2 T
 > (`execution_start` → `execution_success`). Same card, same day, same workflow for both stacks.
 > Every table, the test machine and the method: **[BENCHMARKS.md](omni/docs/BENCHMARKS.md)**.
 
-The image was verified separately: the full suite run inside the container matches the bare-metal
-numbers (H3 55.1 – 55.7 s vs. 55.7 – 56.0 s, and likewise for the other three models).
+The published image was verified as a user gets it: pulled anonymously from Docker Hub onto a
+machine with no local copy, then the full suite run inside it. It matches the bare-metal numbers
+(H3 55.6 – 55.7 s vs. 55.7 – 56.0 s, and likewise for the other three models).
 
 ## Quick start
 

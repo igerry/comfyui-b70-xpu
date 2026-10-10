@@ -113,6 +113,10 @@ older than the host's (the card is reported as `Intel(R) Graphics [0xe223]`); no
 showed up. The image published on Docker Hub is a later build of the same content split into 17
 layers; it passed the validator and one job per model (H3 55.8 s new seed) before it was pushed.
 After publication it was pulled anonymously onto a machine with no local copy (all 17 layers
-downloaded, 4.05 GB, same digest) and passed the validator again.
+downloaded, 4.05 GB, same digest) and passed the validator again. The full suite was then run in
+that pulled image: 29 jobs, all successful, 0 errors in the container log. H3 55.6 – 55.7 s new seed
+and 73.7 s new prompt (INT8 VAE: 52.8 / 76.8 s); Krea-2 9.9 s bf16, 15.2 s new prompt, 6.9 s INT8;
+Qwen-Image 2.1 15.7 s bf16, 5.1 s Viggle, 10.3 s INT8, 67.3 – 69.2 s at 2048²; Music 3 78.7 s fp16,
+53.5 – 55.3 s INT8, 77.1 – 88.7 s new song.
 Not run in the container: the Turbo sampler node and MultiRef workflows (third-party
 nodes), and anything without `--privileged`.
